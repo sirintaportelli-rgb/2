@@ -3,6 +3,24 @@ import { createGameplayMusic, playCoinSound, playBuildSound, playErrorSound, pla
 import { GRID_W, GRID_H, METERS_PER_CELL, INITIAL_POP } from "./constants";
 import { distanceBetween, distanceInMeters, radiusInTiles } from "./utils/geometry";
 import { computePowerCapacity, computeEnergyConsumption } from "./engine/power";
+import { computeHousingPop, computePopFromHousing } from "./engine/population";
+import { computeWorkerSplit } from "./engine/workforce";
+import { computeGeneratorTotals, computeCityLevel, computeResearchPoints, computeMaterialsProduction } from "./engine/economy";
+import { computePollutionZones, POLLUTION_SOURCES } from "./engine/pollution";
+import { checkRoadAnswer } from "./engine/roads";
+import WeekEndReport from "./challenges/WeekEndReport";
+import LociIntro from "./challenges/LociIntro";
+import HigherOrderEvent from "./challenges/HigherOrderEvent";
+import JobLottery from "./challenges/JobLottery";
+import RoadCalc from "./challenges/RoadCalc";
+import ResearchCalc from "./challenges/ResearchCalc";
+import DemographicsCalc from "./challenges/DemographicsCalc";
+import PipeCalc from "./challenges/PipeCalc";
+import CurvedRoadCalc from "./challenges/CurvedRoadCalc";
+import PollutionCalc from "./challenges/PollutionCalc";
+import WaterConsumption from "./challenges/WaterConsumption";
+import WorkerCalc from "./challenges/WorkerCalc";
+import EnergyCalc from "./challenges/EnergyCalc";
 import { S } from "./styles";
 import {
   CLIMATE_THEMES, TERRAIN_FEATURES, BUILDINGS, TOOL_CATEGORIES, ZONE_TYPES, BUILD_ITEMS, GOODS_BUILDINGS, EDUCATION_BUILDINGS, TASKS, HOUSING_TYPES, SECTOR_PRODUCTION, PIPE_SPECS, WATER_USAGE, UTILITY_BUILDINGS, TECH_TREE, GENERATORS,
@@ -451,20 +469,7 @@ export default function STEMCityTerrain({ config, muted, onToggleMute }) {
 
   // ═══ DEMOGRAPHICS ═══
 
-  const housingPop = useMemo(() => {
-    let total = 0, adults = 0, children = 0, elderly = 0;
-    Object.values(placed).forEach(b => {
-      const h = HOUSING_TYPES[b.type];
-      if (!h) return;
-      const totalParts = h.ratio.adults + h.ratio.children + h.ratio.elderly;
-      const perPart = h.population / totalParts;
-      const a = Math.round(h.ratio.adults * perPart);
-      const c = Math.round(h.ratio.children * perPart);
-      const e = Math.round(h.ratio.elderly * perPart);
-      adults += a; children += c; elderly += e; total += h.population;
-    });
-    return { total, adults, children, elderly };
-  }, [placed]);
+  const housingPop = useMemo(() => computeHousingPop(placed, HOUSING_TYPES), [placed]);
   const demographics = { adults: INITIAL_POP.adults + housingPop.adults, children: INITIAL_POP.children + housingPop.children, elderly: INITIAL_POP.elderly + housingPop.elderly };
   const totalPop = demographics.adults + demographics.children + demographics.elderly;
 
@@ -480,11 +485,7 @@ export default function STEMCityTerrain({ config, muted, onToggleMute }) {
   const [demoHardAnswer, setDemoHardAnswer] = useState("");
 
   // Population from housing only (excluding initial 100)
-  const popFromHousing = useMemo(() => {
-    let p = 0;
-    Object.values(placed).forEach(b => { if (HOUSING_TYPES[b.type]) p += HOUSING_TYPES[b.type].population; });
-    return p;
-  }, [placed]);
+  const popFromHousing = useMemo(() => computePopFromHousing(placed, HOUSING_TYPES), [placed]);
 
   // ═══ JOB SECTOR RANDOMIZER ═══
   const [showJobRandom, setShowJobRandom] = useState(false);
@@ -527,28 +528,7 @@ export default function STEMCityTerrain({ config, muted, onToggleMute }) {
   }, [roadCalcDone, jobResultLocked, jobResult, workerCalcPassed, showWorkerCalc]);
 
   // Calculate correct answers: adults × sector percentage
-  const workerCalcCorrect = useMemo(() => {
-    if (!jobResult) return { primary: 0, secondary: 0, tertiary: 0, totalAdults: 0, production: {} };
-    const totalAdults = demographics.adults;
-    const workers = {
-      primary: Math.round(totalAdults * jobResult.split.primary / 100),
-      secondary: Math.round(totalAdults * jobResult.split.secondary / 100),
-      tertiary: Math.round(totalAdults * jobResult.split.tertiary / 100),
-    };
-    // Production: (workers / per) × rate, then ÷ divisor if present
-    const production = {};
-    ["primary", "secondary", "tertiary"].forEach(s => {
-      const sp = SECTOR_PRODUCTION[s];
-      const raw = (workers[s] / sp.per) * sp.rate;
-      production[s] = sp.divisor ? raw / sp.divisor : raw;
-    });
-    // Hard mode: probability distribution on dominant sector
-    const N = workers[jobResult.dominant]; // number of workers in dominant sector
-    const kVal = 6 / (N * N * N); // k = 6/N³
-    const probUnderQuarter = 5 / 32; // P(X < N/4) = 5/32 always
-    const underperformCount = Math.round(probUnderQuarter * N * 100) / 100; // 5N/32
-    return { ...workers, totalAdults, production, hard: { N, kVal, probUnderQuarter, underperformCount } };
-  }, [jobResult, demographics]);
+  const workerCalcCorrect = useMemo(() => computeWorkerSplit(jobResult, demographics, SECTOR_PRODUCTION), [jobResult, demographics]);
 
   // ═══ AUTO-DISTRIBUTE WORKERS TO BUILDINGS ═══
   const workerDistribution = useMemo(() => {
@@ -1007,44 +987,8 @@ export default function STEMCityTerrain({ config, muted, onToggleMute }) {
   };
   
 
-  // Pollution sources: all things that generate pollution
-  const POLLUTION_SOURCES = {
-    // Pipes generate noise pollution along their length
-    water_pipe: { noise: 300 }, // 0.3km
-    sewage_pipe: { noise: 300 }, // 0.3km
-    // Garbage disposal generates all three types
-    garbage: { noise: 200, ground: 1000, air: 900 },
-    // Mining generates noise and ground pollution
-    mine: { noise: 400, ground: 500 },
-  };
-
-  // Calculate pollution zones from all sources
-  const pollutionZones = useMemo(() => {
-    const zones = { noise: [], ground: [], air: [] };
-
-    // From placed pipes
-    placedPipes.forEach(p => {
-      const src = p.type === "water" ? POLLUTION_SOURCES.water_pipe : POLLUTION_SOURCES.sewage_pipe;
-      if (src.noise) {
-        // Pollution along pipe endpoints
-        zones.noise.push({ x: p.x1, y: p.y1, radiusM: src.noise, source: `${p.type} pipe` });
-        zones.noise.push({ x: p.x2, y: p.y2, radiusM: src.noise, source: `${p.type} pipe` });
-      }
-    });
-
-    // From placed utility and goods buildings
-    Object.entries(placed).forEach(([k, b]) => {
-      const src = POLLUTION_SOURCES[b.type];
-      if (!src) return;
-      const [gx, gy] = k.split(",").map(Number);
-      const bName = UTILITY_BUILDINGS[b.type]?.name || GOODS_BUILDINGS[b.type]?.name || b.type;
-      if (src.noise) zones.noise.push({ x: gx, y: gy, radiusM: src.noise, source: bName });
-      if (src.ground) zones.ground.push({ x: gx, y: gy, radiusM: src.ground, source: bName });
-      if (src.air) zones.air.push({ x: gx, y: gy, radiusM: src.air, source: bName });
-    });
-
-    return zones;
-  }, [placed, placedPipes]);
+  // Pollution zones from all sources (POLLUTION_SOURCES lives in engine/pollution)
+  const pollutionZones = useMemo(() => computePollutionZones(placed, placedPipes, { UTILITY_BUILDINGS, GOODS_BUILDINGS }), [placed, placedPipes]);
 
   // Count pollution sources for task tracking
   const garbageCount = useMemo(() => Object.values(placed).filter(b => b.type === "garbage").length, [placed]);
@@ -1194,34 +1138,13 @@ export default function STEMCityTerrain({ config, muted, onToggleMute }) {
   }, [placed]);
 
   // City level: based on progress milestones (must be after energyCount, totalPop, garbageCount)
-  const cityLevel = useMemo(() => {
-    let level = 1;
-    if (energyCount >= 5) level = 2;
-    if (totalPop >= 200) level = 3;
-    if (garbageCount >= 1) level = 4;
-    if (placedRoads.length >= 3) level = 5;
-    if (totalPop >= 500 && placedRoads.length >= 6) level = 6;
-    if (totalPop >= 1000) level = 7;
-    return level;
-  }, [energyCount, totalPop, garbageCount, placedRoads]);
+  const cityLevel = useMemo(() => computeCityLevel(energyCount, totalPop, garbageCount, placedRoads.length), [energyCount, totalPop, garbageCount, placedRoads]);
 
   // Curved roads: unlocked on hard mode OR city level 5+
   const curvedRoadsUnlocked = mathDifficulty === "hard" || cityLevel >= 5;
 
   // Calculate correct totals for the challenge
-  const generatorTotals = useMemo(() => {
-    let totalMW = 0, totalCost = 0;
-    const breakdown = [];
-    Object.values(placed).forEach(b => {
-      const gen = GENERATORS[b.type];
-      if (gen) {
-        totalMW += gen.power;
-        totalCost += gen.cost;
-        breakdown.push({ name: gen.name, power: gen.power, cost: gen.cost });
-      }
-    });
-    return { totalMW, totalCost, breakdown };
-  }, [placed]);
+  const generatorTotals = useMemo(() => computeGeneratorTotals(placed, GENERATORS), [placed]);
 
   // When 5 generators placed → trigger calculation challenge (not instant completion)
   useEffect(() => {
@@ -1570,24 +1493,8 @@ export default function STEMCityTerrain({ config, muted, onToggleMute }) {
     return total;
   }, [placed, placedPipes]);
   const roadCount = useMemo(() => Object.values(placed).filter(b => b.type === "road").length, [placed]);
-  const researchPts = useMemo(() => {
-    let r = 0;
-    Object.values(placed).forEach(b => {
-      if (b.type === "school") r += 15;
-      if (b.type === "hospital") r += 5;
-    });
-    if (government === "education") r = Math.floor(r * 1.25);
-    if (government === "technological") r = Math.floor(r * 1.15);
-    return r;
-  }, [placed, government]);
-  const materialsProd = useMemo(() => {
-    let m = 0;
-    Object.values(placed).forEach(b => {
-      if (b.type === "factory") m += 40;
-    });
-    if (civics === "merchant") m = Math.floor(m * 1.2);
-    return m;
-  }, [placed, civics]);
+  const researchPts = useMemo(() => computeResearchPoints(placed, government), [placed, government]);
+  const materialsProd = useMemo(() => computeMaterialsProduction(placed, civics), [placed, civics]);
 
   useEffect(() => { setPopulation(popCount); }, [popCount]);
   useEffect(() => { setPower(powerCap); }, [powerCap]);
@@ -1965,85 +1872,29 @@ export default function STEMCityTerrain({ config, muted, onToggleMute }) {
   // Road calculation checker (medium mode)
   const checkRoadCalc = () => {
     if (!pendingRoad) return;
-    const { mc1, mc2, gradient, yIntercept } = pendingRoad;
-    const dx = mc2.x - mc1.x;
-    const dy = mc2.y - mc1.y;
+    const { mc1, mc2, gradient } = pendingRoad;
     const penalty = () => { const p = Math.floor(coins * 0.1); setCoins(c => c - p); setRoadCalcAttempts(a => a + 1); return p; };
+    const result = checkRoadAnswer(pendingRoad, roadQuestionType, roadCalcAnswer);
 
-    if (roadQuestionType === 1) {
-      // Gradient: m = (y2-y1)/(x2-x1)
-      const ans = parseFloat(roadCalcAnswer);
-      const correct = dx === 0 ? Infinity : dy / dx;
-      if (dx === 0 && (roadCalcAnswer.toLowerCase().includes("undef") || roadCalcAnswer.toLowerCase().includes("inf"))) {
-        placeRoadSuccess();
-      } else if (!isNaN(ans) && Math.abs(ans - correct) < 0.05) {
-        placeRoadSuccess();
-      } else {
-        const p = penalty();
-        setRoadCalcFeedback({ type: "error", msg: `❌ Incorrect. m = (y₂ − y₁) ÷ (x₂ − x₁) = (${mc2.y} − ${mc1.y}) ÷ (${mc2.x} − ${mc1.x}). (-§${p.toLocaleString()})` });
-      }
-    } else if (roadQuestionType === 2) {
-      // Equation: y = mx + c
-      const ans = roadCalcAnswer.replace(/\s/g, "").toLowerCase();
-      const m = gradient;
-      const c = yIntercept;
-      let correct = false;
-      if (dx === 0 && ans.includes(`x=${mc1.x}`)) correct = true;
-      else if (dx !== 0) {
-        const mStr = m % 1 === 0 ? String(m) : m.toFixed(2);
-        const cStr = c % 1 === 0 ? String(Math.abs(c)) : Math.abs(c).toFixed(2);
-        const expected = `y=${mStr}x${c >= 0 ? "+" : "-"}${cStr}`;
-        if (ans === expected || ans === expected.replace("+", "")) correct = true;
-        const ansM = parseFloat(ans.match(/y=([0-9.-]+)x/)?.[1]);
-        const ansC = parseFloat(ans.match(/x([+-][0-9.]+)/)?.[1]);
-        if (!isNaN(ansM) && !isNaN(ansC) && Math.abs(ansM - m) < 0.05 && Math.abs(ansC - c) < 0.5) correct = true;
-      }
-      if (correct) {
-        placeRoadSuccess();
-      } else {
-        const p = penalty();
-        setRoadCalcFeedback({ type: "error", msg: `❌ Incorrect. Find m first, then use y − y₁ = m(x − x₁) to get y = mx + c. (-§${p.toLocaleString()})` });
-      }
-    } else if (roadQuestionType === 3) {
-      // Perpendicular: just confirm they know the perpendicular gradient
-      const ans = parseFloat(roadCalcAnswer);
-      let correctPerp;
-      if (gradient === 0) correctPerp = "vertical";
-      else if (gradient === Infinity) correctPerp = 0;
-      else correctPerp = -1 / gradient;
-
-      if (correctPerp === "vertical" && (roadCalcAnswer.toLowerCase().includes("undef") || roadCalcAnswer.toLowerCase().includes("inf"))) {
-        // Place the original road, then ask them to draw perp
-        placeRoadAndAwaitPerp(correctPerp);
-      } else if (typeof correctPerp === "number" && !isNaN(ans) && Math.abs(ans - correctPerp) < 0.1) {
-        placeRoadAndAwaitPerp(correctPerp);
-      } else {
-        const p = penalty();
-        setRoadCalcFeedback({ type: "error", msg: `❌ Incorrect. Perpendicular gradient = −1 ÷ m. If m = ${gradient === Infinity ? "undefined" : gradient.toFixed(2)}, perpendicular m = ? (-§${p.toLocaleString()})` });
-      }
-    } else if (roadQuestionType === 4) {
-      // ax + by + c = 0 form
-      const ans = roadCalcAnswer.replace(/\s/g, "").toLowerCase();
-      let a, b, cc;
-      if (dx === 0) { a = 1; b = 0; cc = -mc1.x; }
-      else {
-        // y = mx + c → mx - y + c = 0 → dy·x - dx·y + (dx·y1 - dy·x1) = 0
-        a = dy; b = -dx; cc = dx * mc1.y - dy * mc1.x;
-        function gcd2(x, y) { return y === 0 ? Math.abs(x) : gcd2(y, x % y); }
-        const g = [a, b, cc].reduce((acc, v) => gcd2(acc, Math.abs(v)));
-        if (g > 0) { a /= g; b /= g; cc /= g; }
-        if (a < 0) { a = -a; b = -b; cc = -cc; }
-      }
-      // Check answer
-      const expected = `${a}x${b >= 0 ? "+" : ""}${b}y${cc >= 0 ? "+" : ""}${cc}=0`;
-      const expectedAlt = `${a}x${b >= 0 ? "+" : ""}${b}y${cc >= 0 ? "+" : ""}${cc}`;
-      if (ans === expected || ans === expectedAlt || ans === expected.replace(/\+/g, "") || ans + "=0" === expected) {
-        placeRoadSuccess();
-      } else {
-        const p = penalty();
-        setRoadCalcFeedback({ type: "error", msg: `❌ Incorrect. Rearrange y = mx + c to ax + by + c = 0. Expected: ${a}x ${b >= 0 ? "+" : "−"} ${Math.abs(b)}y ${cc >= 0 ? "+" : "−"} ${Math.abs(cc)} = 0. (-§${p.toLocaleString()})` });
-      }
+    if (roadQuestionType === 3) {
+      if (result.correct) { placeRoadAndAwaitPerp(result.perpGradient); }
+      else { const p = penalty(); setRoadCalcFeedback({ type: "error", msg: `❌ Incorrect. Perpendicular gradient = −1 ÷ m. If m = ${gradient === Infinity ? "undefined" : gradient.toFixed(2)}, perpendicular m = ? (-§${p.toLocaleString()})` }); }
+      return;
     }
+
+    if (result.correct) { placeRoadSuccess(); return; }
+
+    const p = penalty();
+    let msg;
+    if (roadQuestionType === 1) {
+      msg = `❌ Incorrect. m = (y₂ − y₁) ÷ (x₂ − x₁) = (${mc2.y} − ${mc1.y}) ÷ (${mc2.x} − ${mc1.x}). (-§${p.toLocaleString()})`;
+    } else if (roadQuestionType === 2) {
+      msg = `❌ Incorrect. Find m first, then use y − y₁ = m(x − x₁) to get y = mx + c. (-§${p.toLocaleString()})`;
+    } else if (roadQuestionType === 4) {
+      const { a, b, cc } = result.coeffs;
+      msg = `❌ Incorrect. Rearrange y = mx + c to ax + by + c = 0. Expected: ${a}x ${b >= 0 ? "+" : "−"} ${Math.abs(b)}y ${cc >= 0 ? "+" : "−"} ${Math.abs(cc)} = 0. (-§${p.toLocaleString()})`;
+    }
+    setRoadCalcFeedback({ type: "error", msg });
   };
 
   const placeRoadSuccess = () => {
@@ -3051,45 +2902,18 @@ export default function STEMCityTerrain({ config, muted, onToggleMute }) {
 
       {/* Research Challenge Popup */}
       {showResearchCalc && researchCalcQ && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "460px", textAlign: "left" , ...dragResearch.style}}>
-            <div {...dragResearch.handleProps} style={{...S.dragHandle, ...dragResearch.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "16px", position: "relative" }}>
-              <div style={{ fontSize: "40px", marginBottom: "4px" }}>🔬</div>
-              <div style={{ ...S.popupBadge, background: "#c084fc20", borderColor: "#c084fc40", color: "#c084fc" }}>RESEARCH CHALLENGE</div>
-              <div style={{ fontSize: "10px", color: "#64748b", marginTop: "4px" }}>Difficulty: Level {researchCalcQ.difficulty}/10 · {universityCount} {universityCount === 1 ? "university" : "universities"} = +{universityCount * 20} RP</div>
-            </div>
-
-            {activeResearch && <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 12px", background: "#0a0f1a", borderRadius: "8px", border: "1px solid #c084fc30", marginBottom: "14px" }}>
-              <div>
-                <div style={{ fontSize: "9px", color: "#64748b" }}>Researching</div>
-                <div style={{ fontSize: "12px", fontWeight: 700, color: "#c084fc" }}>{TECH_TREE[activeResearch]?.icon} {TECH_TREE[activeResearch]?.name}</div>
-              </div>
-              <div style={{ textAlign: "right" }}>
-                <div style={{ fontSize: "12px", fontWeight: 700, color: "#fbbf24", fontFamily: "monospace" }}>{researchProgress}/{TECH_TREE[activeResearch]?.cost} RP</div>
-                <div style={{ width: "80px", height: "4px", background: "#1a2a4a", borderRadius: "2px", marginTop: "3px" }}>
-                  <div style={{ width: `${Math.min(100, (researchProgress / TECH_TREE[activeResearch]?.cost) * 100)}%`, height: "100%", background: "#c084fc", borderRadius: "2px" }} />
-                </div>
-              </div>
-            </div>}
-
-            <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "16px", marginBottom: "16px", border: "1px solid #1a2a4a", textAlign: "center", position: "relative" }}>
-              <div style={{ fontSize: "18px", fontWeight: 800, color: "#e2e8f0", fontFamily: "monospace", lineHeight: 1.6 }}>{researchCalcQ.question}</div>
-            </div>
-
-            <div style={{ marginBottom: "16px" }}>
-              <input value={researchCalcAnswer} onChange={e => setResearchCalcAnswer(e.target.value)} onKeyDown={e => e.key === "Enter" && checkResearchAnswer()} placeholder="Your answer" style={{ width: "100%", padding: "14px", borderRadius: "10px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "20px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} autoFocus />
-            </div>
-
-            {researchCalcFeedback && (<div style={{ padding: "10px 14px", borderRadius: "8px", marginBottom: "12px", fontSize: "12px", fontWeight: 600, position: "relative", background: researchCalcFeedback.type === "success" ? "#4ade8015" : "#ef444415", border: `1px solid ${researchCalcFeedback.type === "success" ? "#4ade8040" : "#ef444440"}`, color: researchCalcFeedback.type === "success" ? "#4ade80" : "#fca5a5" }}>{researchCalcFeedback.msg}</div>)}
-
-            <div style={{ display: "flex", gap: "8px" }}>
-              <button onClick={checkResearchAnswer} style={{ ...S.popupBtn, flex: 1, textAlign: "center", background: "linear-gradient(135deg, #a78bfa, #7c3aed)" }}>✓ Submit</button>
-              <button onClick={() => setShowResearchCalc(false)} style={{ padding: "10px 16px", borderRadius: "10px", background: "#1a2a4a", border: "1px solid #2a3a5e", color: "#94a3b8", cursor: "pointer", fontWeight: 600, fontSize: "12px", fontFamily: "inherit" }}>Close</button>
-            </div>
-          </div>
-        </div>
+        <ResearchCalc
+          drag={dragResearch}
+          q={researchCalcQ}
+          universityCount={universityCount}
+          activeResearch={activeResearch}
+          researchProgress={researchProgress}
+          answer={researchCalcAnswer}
+          setAnswer={setResearchCalcAnswer}
+          onSubmit={checkResearchAnswer}
+          feedback={researchCalcFeedback}
+          onClose={() => setShowResearchCalc(false)}
+        />
       )}
 
       {/* Tech Tree Modal */}
@@ -3181,1398 +3005,339 @@ export default function STEMCityTerrain({ config, muted, onToggleMute }) {
 
       {/* Demographics Calculation Challenge */}
       {showDemoCalc && !demoCalcPassed && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "520px", textAlign: "left" , ...dragDemo.style }}>
-            <div {...dragDemo.handleProps} style={{...S.dragHandle, ...dragDemo.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "16px", position: "relative" }}>
-              <div style={{ fontSize: "48px", marginBottom: "4px" }}>👥</div>
-              <div style={{ ...S.popupBadge, background: "#60a5fa20", borderColor: "#60a5fa40", color: "#60a5fa" }}>DEMOGRAPHICS CHALLENGE</div>
-              <div style={{ display: "inline-block", padding: "2px 10px", borderRadius: "6px", marginTop: "6px", fontSize: "10px", fontWeight: 700, background: mathDifficulty === "easy" ? "#22c55e20" : mathDifficulty === "hard" ? "#ef444420" : "#f59e0b20", color: mathDifficulty === "easy" ? "#4ade80" : mathDifficulty === "hard" ? "#fca5a5" : "#fbbf24" }}>
-                {mathDifficulty === "easy" ? "🟢 Easy" : mathDifficulty === "hard" ? "🔴 Hard" : "🟡 Medium"}{demoPhase > 1 && ` — Step ${demoPhase}`}
-              </div>
-            </div>
-
-            {demoPhase === 1 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-                Based on the population ratios of your homes, how many <strong style={{ color: "#60a5fa" }}>adults</strong>, <strong style={{ color: "#4ade80" }}>children</strong>, and <strong style={{ color: "#fb923c" }}>elderly</strong> are among the 200 people who move in?
-              </p>
-
-              <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "14px", marginBottom: "16px", border: "1px solid #1a2a4a", position: "relative" }}>
-                <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "1px", marginBottom: "10px" }}>Your Housing</div>
-                {housingCount.houses > 0 && <div style={{ padding: "8px 10px", borderRadius: "6px", background: "#1a2a4a40", marginBottom: "8px" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <div><div style={{ fontSize: "10px", color: "#64748b" }}>🏠 Houses</div><div style={{ fontSize: "13px", fontWeight: 700, color: "#60a5fa", fontFamily: "monospace" }}>{housingCount.houses} × {HOUSING_TYPES.house.population} = {housingCount.houses * HOUSING_TYPES.house.population} people</div></div>
-                    <div style={{ textAlign: "right" }}><div style={{ fontSize: "9px", color: "#facc15" }}>Ratio 5 : 4 : 1</div><div style={{ fontSize: "8px", color: "#94a3b8" }}>adults : children : elderly</div></div>
-                  </div>
-                </div>}
-                {housingCount.condos > 0 && <div style={{ padding: "8px 10px", borderRadius: "6px", background: "#1a2a4a40", marginBottom: "8px" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <div><div style={{ fontSize: "10px", color: "#64748b" }}>🏢 Condos</div><div style={{ fontSize: "13px", fontWeight: 700, color: "#818cf8", fontFamily: "monospace" }}>{housingCount.condos} × {HOUSING_TYPES.condo.population} = {housingCount.condos * HOUSING_TYPES.condo.population} people</div></div>
-                    <div style={{ textAlign: "right" }}><div style={{ fontSize: "9px", color: "#facc15" }}>Ratio 8 : 1 : 1</div><div style={{ fontSize: "8px", color: "#94a3b8" }}>adults : children : elderly</div></div>
-                  </div>
-                </div>}
-                <div style={{ padding: "6px 8px", borderRadius: "6px", background: "#f59e0b10", border: "1px solid #f59e0b30", fontSize: "9px", color: "#f59e0b", fontFamily: "monospace", lineHeight: 1.5 }}>💡 Split each type using its ratio. e.g. House: 10 people, ratio 5:4:1 → 5 adults, 4 children, 1 elderly</div>
-              </div>
-
-              <div style={{ display: "flex", gap: "10px", marginBottom: "16px", position: "relative" }}>
-                {[{k:"adults",l:"👤 Adults",c:"#60a5fa"},{k:"children",l:"👶 Children",c:"#4ade80"},{k:"elderly",l:"👴 Elderly",c:"#fb923c"}].map(f =>
-                  <div key={f.k} style={{ flex: 1 }}><label style={{ fontSize: "10px", fontWeight: 700, color: f.c, display: "block", marginBottom: "4px" }}>{f.l}</label><input value={demoCalcAnswers[f.k]} onChange={e => setDemoCalcAnswers(p => ({ ...p, [f.k]: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkDemoCalc()} placeholder="?" style={{ width: "100%", padding: "10px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} /></div>
-                )}
-              </div>
-            </>}
-
-            {demoPhase === 2 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-                <strong style={{ color: "#ef4444" }}>10 adults</strong>, <strong style={{ color: "#ef4444" }}>2 children</strong>, and <strong style={{ color: "#ef4444" }}>2 elderly</strong> do not move in as planned. What are the <strong style={{ color: "#facc15" }}>new ratios</strong>? Give your answer in <strong style={{ color: "#facc15" }}>simplest whole numbers</strong>.
-              </p>
-              <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "14px", marginBottom: "16px", border: "1px solid #1a2a4a", position: "relative" }}>
-                <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", marginBottom: "8px" }}>ORIGINAL (from step 1)</div>
-                <div style={{ display: "flex", gap: "12px", fontSize: "13px", fontFamily: "monospace", fontWeight: 700, marginBottom: "10px" }}>
-                  <span style={{ color: "#60a5fa" }}>Adults: {newResidentDemo.adults}</span><span style={{ color: "#4ade80" }}>Children: {newResidentDemo.children}</span><span style={{ color: "#fb923c" }}>Elderly: {newResidentDemo.elderly}</span>
-                </div>
-                <div style={{ fontSize: "12px", color: "#fca5a5", fontWeight: 600 }}>Subtract: −10 adults, −2 children, −2 elderly</div>
-                <div style={{ marginTop: "8px", padding: "6px 8px", borderRadius: "6px", background: "#f59e0b10", border: "1px solid #f59e0b30", fontSize: "9px", color: "#f59e0b", fontFamily: "monospace" }}>💡 Subtract, then find the HCF to simplify the ratio</div>
-              </div>
-              <div style={{ fontSize: "11px", color: "#94a3b8", marginBottom: "8px", fontWeight: 600 }}>New ratio (simplest form): Adults : Children : Elderly</div>
-              <div style={{ display: "flex", gap: "8px", marginBottom: "16px", position: "relative", alignItems: "center" }}>
-                {[{k:"adults",c:"#60a5fa"},{k:"children",c:"#4ade80"},{k:"elderly",c:"#fb923c"}].map((f, i) =>
-                  <React.Fragment key={f.k}>{i > 0 && <span style={{ color: "#64748b", fontSize: "18px", fontWeight: 700 }}>:</span>}<div style={{ flex: 1 }}><input value={demoMediumAnswers[f.k]} onChange={e => setDemoMediumAnswers(p => ({ ...p, [f.k]: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkDemoCalc()} placeholder="?" style={{ width: "100%", padding: "10px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} /></div></React.Fragment>
-                )}
-              </div>
-            </>}
-
-            {demoPhase === 3 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-                You have <strong style={{ color: "#facc15" }}>{housingCount.total} housing units</strong> and <strong style={{ color: "#c084fc" }}>3 community groups</strong> (families, couples, singles). Each group must be assigned to a different housing unit. How many <strong style={{ color: "#facc15" }}>unique arrangements</strong> are possible?
-              </p>
-              <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "14px", marginBottom: "16px", border: "1px solid #1a2a4a", position: "relative" }}>
-                <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", marginBottom: "8px" }}>PERMUTATIONS</div>
-                <div style={{ fontSize: "12px", color: "#94a3b8", fontFamily: "monospace", lineHeight: 1.6 }}>n = {housingCount.total} housing units, r = 3 groups<br/>P(n, r) = n! ÷ (n − r)!</div>
-                <div style={{ marginTop: "8px", padding: "6px 8px", borderRadius: "6px", background: "#c084fc10", border: "1px solid #c084fc30", fontSize: "9px", color: "#c084fc", fontFamily: "monospace" }}>💡 First group: {housingCount.total} choices. Second: {housingCount.total - 1}. Third: {housingCount.total - 2}.</div>
-              </div>
-              <div><label style={{ fontSize: "11px", fontWeight: 700, color: "#c084fc", display: "block", marginBottom: "4px" }}>Total unique arrangements</label><input value={demoHardAnswer} onChange={e => setDemoHardAnswer(e.target.value)} onKeyDown={e => e.key === "Enter" && checkDemoCalc()} placeholder="?" style={{ width: "100%", padding: "12px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "20px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none", marginBottom: "16px" }} /></div>
-            </>}
-
-            {demoCalcFeedback && (<div style={{ padding: "10px 14px", borderRadius: "8px", marginBottom: "12px", fontSize: "12px", fontWeight: 600, position: "relative", background: demoCalcFeedback.type === "success" ? "#4ade8015" : "#ef444415", border: `1px solid ${demoCalcFeedback.type === "success" ? "#4ade8040" : "#ef444440"}`, color: demoCalcFeedback.type === "success" ? "#4ade80" : "#fca5a5" }}>{demoCalcFeedback.msg}</div>)}
-            {demoCalcAttempts > 0 && <div style={{ fontSize: "10px", color: "#ef4444", textAlign: "center", marginBottom: "8px", position: "relative" }}>Attempts: {demoCalcAttempts}</div>}
-            <button onClick={checkDemoCalc} style={{ ...S.popupBtn, width: "100%", textAlign: "center", background: "linear-gradient(135deg, #3b82f6, #2563eb)" }}>{demoPhase === 1 ? "✓ Submit Demographics" : demoPhase === 2 ? "✓ Submit Ratio" : "✓ Submit Answer"}</button>
-            <div style={{ textAlign: "center", marginTop: "8px", fontSize: "9px", color: "#475569", position: "relative" }}>⚠ Each wrong answer costs 10% of your treasury</div>
-          </div>
-        </div>
+        <DemographicsCalc
+          drag={dragDemo}
+          difficulty={mathDifficulty}
+          phase={demoPhase}
+          housingCount={housingCount}
+          newResidentDemo={newResidentDemo}
+          phase1Answers={demoCalcAnswers}
+          setPhase1Answers={setDemoCalcAnswers}
+          phase2Answers={demoMediumAnswers}
+          setPhase2Answers={setDemoMediumAnswers}
+          hardAnswer={demoHardAnswer}
+          setHardAnswer={setDemoHardAnswer}
+          feedback={demoCalcFeedback}
+          attempts={demoCalcAttempts}
+          onSubmit={checkDemoCalc}
+        />
       )}
 
       {/* Road Calculation Challenge (Medium/Hard) */}
       {showRoadCalc && pendingRoad && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "500px", textAlign: "left" , ...dragRoad.style }}>
-            <div {...dragRoad.handleProps} style={{...S.dragHandle, ...dragRoad.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "16px", position: "relative" }}>
-              <div style={{ fontSize: "48px", marginBottom: "4px" }}>🛣️</div>
-              <div style={{ ...S.popupBadge, background: "#9ca3af20", borderColor: "#9ca3af40", color: "#9ca3af" }}>ROAD CHALLENGE</div>
-            </div>
-
-            <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "12px", marginBottom: "16px", border: "1px solid #1a2a4a", position: "relative" }}>
-              <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "1px", marginBottom: "8px" }}>Your Road</div>
-              <div style={{ display: "flex", gap: "16px", fontSize: "13px", fontFamily: "monospace", fontWeight: 700 }}>
-                <span style={{ color: "#60a5fa" }}>Start: ({pendingRoad.mc1?.x}, {pendingRoad.mc1?.y})</span>
-                <span style={{ color: "#4ade80" }}>End: ({pendingRoad.mc2?.x}, {pendingRoad.mc2?.y})</span>
-              </div>
-            </div>
-
-            {roadQuestionType === 1 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-                Using the two coordinate points on your road, what is the <strong style={{ color: "#facc15" }}>gradient</strong> of this road?
-              </p>
-              <div style={{ fontSize: "9px", color: "#64748b", fontFamily: "monospace", marginBottom: "12px" }}>💡 m = (y₂ − y₁) ÷ (x₂ − x₁)</div>
-              <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "16px" }}>
-                <span style={{ fontSize: "12px", fontWeight: 700, color: "#facc15" }}>m =</span>
-                <input value={roadCalcAnswer} onChange={e => setRoadCalcAnswer(e.target.value)} onKeyDown={e => e.key === "Enter" && checkRoadCalc()} placeholder="e.g. 0.5" style={{ flex: 1, padding: "10px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-              </div>
-            </>}
-
-            {roadQuestionType === 2 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-                Using the two coordinate points on your road, what is the <strong style={{ color: "#facc15" }}>equation</strong> of this road?
-              </p>
-              <div style={{ fontSize: "9px", color: "#64748b", fontFamily: "monospace", marginBottom: "12px", lineHeight: 1.5 }}>💡 Find m first, then use y − y₁ = m(x − x₁)<br/>Write in the form y = mx + c</div>
-              <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "16px" }}>
-                <input value={roadCalcAnswer} onChange={e => setRoadCalcAnswer(e.target.value)} onKeyDown={e => e.key === "Enter" && checkRoadCalc()} placeholder="e.g. y=2x+3" style={{ flex: 1, padding: "10px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-              </div>
-            </>}
-
-            {roadQuestionType === 3 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-                You need to make a road <strong style={{ color: "#c084fc" }}>perpendicular</strong> to this road. What is the <strong style={{ color: "#facc15" }}>gradient</strong> of the perpendicular road?
-              </p>
-              <div style={{ fontSize: "9px", color: "#64748b", fontFamily: "monospace", marginBottom: "12px" }}>💡 Perpendicular gradient = −1 ÷ original gradient</div>
-              <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "16px" }}>
-                <span style={{ fontSize: "12px", fontWeight: 700, color: "#c084fc" }}>m⊥ =</span>
-                <input value={roadCalcAnswer} onChange={e => setRoadCalcAnswer(e.target.value)} onKeyDown={e => e.key === "Enter" && checkRoadCalc()} placeholder="e.g. -2" style={{ flex: 1, padding: "10px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-              </div>
-              <div style={{ fontSize: "9px", color: "#94a3b8", marginBottom: "8px" }}>After answering, you'll draw the perpendicular road on the map.</div>
-            </>}
-
-            {roadQuestionType === 4 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-                What is the equation of this road in the form <strong style={{ color: "#facc15" }}>ax + by + c = 0</strong>?
-              </p>
-              <div style={{ fontSize: "9px", color: "#64748b", fontFamily: "monospace", marginBottom: "12px", lineHeight: 1.5 }}>💡 Start with y = mx + c, then rearrange so everything is on one side</div>
-              <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "16px" }}>
-                <input value={roadCalcAnswer} onChange={e => setRoadCalcAnswer(e.target.value)} onKeyDown={e => e.key === "Enter" && checkRoadCalc()} placeholder="e.g. 2x-y+3=0" style={{ flex: 1, padding: "10px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-              </div>
-            </>}
-
-            {roadCalcFeedback && (<div style={{ padding: "10px 14px", borderRadius: "8px", marginBottom: "12px", fontSize: "12px", fontWeight: 600, position: "relative", background: roadCalcFeedback.type === "success" ? "#4ade8015" : "#ef444415", border: `1px solid ${roadCalcFeedback.type === "success" ? "#4ade8040" : "#ef444440"}`, color: roadCalcFeedback.type === "success" ? "#4ade80" : "#fca5a5" }}>{roadCalcFeedback.msg}</div>)}
-            {roadCalcAttempts > 0 && <div style={{ fontSize: "10px", color: "#ef4444", textAlign: "center", marginBottom: "8px", position: "relative" }}>Attempts: {roadCalcAttempts}</div>}
-
-            <div style={{ display: "flex", gap: "8px", position: "relative" }}>
-              <button onClick={checkRoadCalc} style={{ ...S.popupBtn, flex: 1, textAlign: "center", background: "linear-gradient(135deg, #6b7280, #4b5563)" }}>✓ Submit</button>
-              <button onClick={() => { setShowRoadCalc(false); setPendingRoad(null); setRoadStart(null); }} style={{ padding: "10px 16px", borderRadius: "10px", background: "#1a2a4a", border: "1px solid #2a3a5e", color: "#94a3b8", cursor: "pointer", fontWeight: 600, fontSize: "12px", fontFamily: "inherit" }}>Cancel</button>
-            </div>
-            <div style={{ textAlign: "center", marginTop: "8px", fontSize: "9px", color: "#475569", position: "relative" }}>⚠ Each wrong answer costs 10% of your treasury</div>
-          </div>
-        </div>
+        <RoadCalc
+          drag={dragRoad}
+          pendingRoad={pendingRoad}
+          questionType={roadQuestionType}
+          answer={roadCalcAnswer}
+          setAnswer={setRoadCalcAnswer}
+          onSubmit={checkRoadCalc}
+          feedback={roadCalcFeedback}
+          attempts={roadCalcAttempts}
+          onCancel={() => { setShowRoadCalc(false); setPendingRoad(null); setRoadStart(null); }}
+        />
       )}
 
       {/* Curved Road Calculation Challenge (Hard) */}
       {showCurvedCalc && pendingCurved && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "520px", textAlign: "left" , ...dragCurved.style}}>
-            <div {...dragCurved.handleProps} style={{...S.dragHandle, ...dragCurved.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "16px", position: "relative" }}>
-              <div style={{ fontSize: "48px", marginBottom: "4px" }}>🟣</div>
-              <div style={{ ...S.popupBadge, background: "#c084fc20", borderColor: "#c084fc40", color: "#c084fc" }}>
-                {curvedBonusPhase === 0 ? "CURVED ROAD — QUADRATIC" : curvedBonusPhase === 1 ? "BONUS — LINEARISATION" : "BONUS — DOMAIN & RANGE"}
-              </div>
-              <div style={{ display: "inline-block", padding: "2px 10px", borderRadius: "6px", marginTop: "6px", fontSize: "10px", fontWeight: 700, background: "#ef444420", color: "#fca5a5" }}>🔴 Hard{curvedBonusPhase > 0 && ` — Bonus ${curvedBonusPhase}/2`}</div>
-            </div>
-
-            {/* Phase progress */}
-            <div style={{ display: "flex", gap: "4px", marginBottom: "16px", position: "relative" }}>
-              {[{n:0,l:"Find A & B"},{n:1,l:"Linearise (logs)"},{n:2,l:"Domain & Range"}].map(s => (
-                <div key={s.n} style={{ flex: 1, padding: "5px", borderRadius: "6px", textAlign: "center", fontSize: "9px", fontWeight: 700,
-                  background: curvedBonusPhase === s.n ? "#c084fc20" : curvedBonusPhase > s.n ? "#4ade8020" : "#1a2a4a",
-                  border: `1px solid ${curvedBonusPhase === s.n ? "#c084fc" : curvedBonusPhase > s.n ? "#4ade80" : "#2a3a5e"}`,
-                  color: curvedBonusPhase === s.n ? "#c084fc" : curvedBonusPhase > s.n ? "#4ade80" : "#475569",
-                }}>{curvedBonusPhase > s.n ? "✓ " : ""}{s.l}</div>
-              ))}
-            </div>
-
-            {/* Phase 0: Find A and B */}
-            {curvedBonusPhase === 0 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-                Your curved road passes through two points. Find the equation in the form <strong style={{ color: "#c084fc" }}>y = Ax² + B</strong>.
-              </p>
-              <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "14px", marginBottom: "16px", border: "1px solid #c084fc30", position: "relative" }}>
-                <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "1px", marginBottom: "10px" }}>Points on the curve</div>
-                <div style={{ display: "flex", gap: "12px" }}>
-                  <div style={{ flex: 1, padding: "10px", borderRadius: "8px", background: "#1a2a4a40", textAlign: "center" }}>
-                    <div style={{ fontSize: "9px", color: "#64748b" }}>Point 1</div>
-                    <div style={{ fontSize: "18px", fontWeight: 800, color: "#c084fc", fontFamily: "monospace" }}>({pendingCurved.mc1.x}, {pendingCurved.mc1.y})</div>
-                  </div>
-                  <div style={{ flex: 1, padding: "10px", borderRadius: "8px", background: "#1a2a4a40", textAlign: "center" }}>
-                    <div style={{ fontSize: "9px", color: "#64748b" }}>Point 2</div>
-                    <div style={{ fontSize: "18px", fontWeight: 800, color: "#c084fc", fontFamily: "monospace" }}>({pendingCurved.mc2.x}, {pendingCurved.mc2.y})</div>
-                  </div>
-                </div>
-                <div style={{ marginTop: "10px", padding: "8px", borderRadius: "6px", background: "#c084fc08", border: "1px solid #c084fc20", fontSize: "9px", color: "#a78bfa", fontFamily: "monospace", lineHeight: 1.6 }}>
-                  💡 Simultaneous equations:<br/>
-                  {pendingCurved.mc1.y} = A({pendingCurved.mc1.x})² + B &nbsp;... ①<br/>
-                  {pendingCurved.mc2.y} = A({pendingCurved.mc2.x})² + B &nbsp;... ②<br/>
-                  Subtract to eliminate B, find A, then B
-                </div>
-              </div>
-              <div style={{ fontSize: "13px", fontWeight: 700, color: "#c084fc", textAlign: "center", fontFamily: "monospace", marginBottom: "16px", position: "relative" }}>y = <span style={{ color: "#facc15" }}>A</span>x² + <span style={{ color: "#22d3ee" }}>B</span></div>
-              <div style={{ display: "flex", gap: "12px", marginBottom: "16px", position: "relative" }}>
-                <div style={{ flex: 1 }}><label style={{ fontSize: "11px", fontWeight: 700, color: "#facc15", display: "block", marginBottom: "4px" }}>A =</label><input value={curvedAnswers.a} onChange={e => setCurvedAnswers(p => ({ ...p, a: e.target.value }))} onKeyDown={e => e.key === "Enter" && curvedAnswers.b && checkCurvedCalc()} placeholder="?" style={{ width: "100%", padding: "12px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "20px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} /></div>
-                <div style={{ flex: 1 }}><label style={{ fontSize: "11px", fontWeight: 700, color: "#22d3ee", display: "block", marginBottom: "4px" }}>B =</label><input value={curvedAnswers.b} onChange={e => setCurvedAnswers(p => ({ ...p, b: e.target.value }))} onKeyDown={e => e.key === "Enter" && curvedAnswers.a && checkCurvedCalc()} placeholder="?" style={{ width: "100%", padding: "12px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "20px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} /></div>
-              </div>
-            </>}
-
-            {/* Phase 1: Linearisation using logs */}
-            {curvedBonusPhase === 1 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "12px", position: "relative" }}>
-                Your road equation is <strong style={{ color: "#c084fc" }}>y = {pendingCurved.A.toFixed(3)}x² + {pendingCurved.B.toFixed(2)}</strong>.
-                Linearise the relationship <strong style={{ color: "#facc15" }}>y − B = Ax²</strong> using logarithms to express it in the form <strong style={{ color: "#4ade80" }}>Y = mX + c</strong>.
-              </p>
-              <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "14px", marginBottom: "16px", border: "1px solid #c084fc30", position: "relative" }}>
-                <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "1px", marginBottom: "8px" }}>Linearisation</div>
-                <div style={{ fontSize: "12px", color: "#e2e8f0", fontFamily: "monospace", lineHeight: 1.8 }}>
-                  y − B = Ax²<br/>
-                  <span style={{ color: "#64748b" }}>Take log₁₀ of both sides:</span><br/>
-                  log(y − B) = log(A) + 2·log(x)<br/>
-                  <span style={{ color: "#64748b" }}>Let Y = log(y − B), X = log(x):</span><br/>
-                  <strong style={{ color: "#4ade80" }}>Y = mX + c</strong>
-                </div>
-                <div style={{ marginTop: "10px", padding: "6px 8px", borderRadius: "6px", background: "#4ade8010", border: "1px solid #4ade8030", fontSize: "9px", color: "#4ade80", fontFamily: "monospace" }}>
-                  💡 The power of x² becomes the gradient m. The log of A becomes the y-intercept c.
-                </div>
-              </div>
-              <div style={{ display: "flex", gap: "12px", marginBottom: "16px", position: "relative" }}>
-                <div style={{ flex: 1 }}><label style={{ fontSize: "11px", fontWeight: 700, color: "#facc15", display: "block", marginBottom: "4px" }}>m (gradient) =</label><input value={curvedBonusAnswers.m} onChange={e => setCurvedBonusAnswers(p => ({ ...p, m: e.target.value }))} onKeyDown={e => e.key === "Enter" && curvedBonusAnswers.c && checkCurvedCalc()} placeholder="?" style={{ width: "100%", padding: "12px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "20px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} /></div>
-                <div style={{ flex: 1 }}><label style={{ fontSize: "11px", fontWeight: 700, color: "#22d3ee", display: "block", marginBottom: "4px" }}>c (y-intercept) =</label><input value={curvedBonusAnswers.c} onChange={e => setCurvedBonusAnswers(p => ({ ...p, c: e.target.value }))} onKeyDown={e => e.key === "Enter" && curvedBonusAnswers.m && checkCurvedCalc()} placeholder={`log₁₀(${Math.abs(pendingCurved.A).toFixed(3)})`} style={{ width: "100%", padding: "12px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "20px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} /></div>
-              </div>
-              <div style={{ fontSize: "9px", color: "#64748b", textAlign: "center", marginBottom: "12px" }}>🎯 Bonus question — +§50,000 reward</div>
-            </>}
-
-            {/* Phase 2: Domain and range */}
-            {curvedBonusPhase === 2 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "12px", position: "relative" }}>
-                Your curved road <strong style={{ color: "#c084fc" }}>y = {pendingCurved.A.toFixed(3)}x² + {pendingCurved.B.toFixed(2)}</strong> runs between the two endpoints. What are the <strong style={{ color: "#facc15" }}>domain</strong> and <strong style={{ color: "#22d3ee" }}>range</strong>?
-              </p>
-              <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "14px", marginBottom: "16px", border: "1px solid #c084fc30", position: "relative" }}>
-                <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "1px", marginBottom: "8px" }}>Endpoints</div>
-                <div style={{ display: "flex", gap: "12px", fontSize: "13px", fontFamily: "monospace", fontWeight: 700 }}>
-                  <span style={{ color: "#c084fc" }}>({pendingCurved.mc1.x}, {pendingCurved.mc1.y})</span>
-                  <span style={{ color: "#64748b" }}>→</span>
-                  <span style={{ color: "#c084fc" }}>({pendingCurved.mc2.x}, {pendingCurved.mc2.y})</span>
-                </div>
-                <div style={{ marginTop: "10px", padding: "6px 8px", borderRadius: "6px", background: "#f59e0b10", border: "1px solid #f59e0b30", fontSize: "9px", color: "#f59e0b", fontFamily: "monospace", lineHeight: 1.6 }}>
-                  💡 Domain = set of valid x-values (between endpoints)<br/>
-                  Range = set of y-values the curve takes{Math.min(pendingCurved.mc1.x, pendingCurved.mc2.x) <= 0 && Math.max(pendingCurved.mc1.x, pendingCurved.mc2.x) >= 0 ? " (check vertex at x=0!)" : ""}
-                </div>
-              </div>
-              <div style={{ display: "flex", gap: "8px", marginBottom: "16px", position: "relative" }}>
-                <div style={{ flex: 1, background: "#0a0f1a", borderRadius: "8px", padding: "10px", border: "1px solid #facc1530" }}>
-                  <div style={{ fontSize: "10px", fontWeight: 700, color: "#facc15", marginBottom: "8px" }}>Domain (x-values)</div>
-                  <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-                    <input value={curvedBonusAnswers.domMin} onChange={e => setCurvedBonusAnswers(p => ({ ...p, domMin: e.target.value }))} placeholder="min" style={{ width: "100%", padding: "8px", borderRadius: "6px", border: "1px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "14px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                    <span style={{ color: "#64748b", fontSize: "12px" }}>≤ x ≤</span>
-                    <input value={curvedBonusAnswers.domMax} onChange={e => setCurvedBonusAnswers(p => ({ ...p, domMax: e.target.value }))} placeholder="max" style={{ width: "100%", padding: "8px", borderRadius: "6px", border: "1px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "14px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                  </div>
-                </div>
-                <div style={{ flex: 1, background: "#0a0f1a", borderRadius: "8px", padding: "10px", border: "1px solid #22d3ee30" }}>
-                  <div style={{ fontSize: "10px", fontWeight: 700, color: "#22d3ee", marginBottom: "8px" }}>Range (y-values)</div>
-                  <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-                    <input value={curvedBonusAnswers.ranMin} onChange={e => setCurvedBonusAnswers(p => ({ ...p, ranMin: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkCurvedCalc()} placeholder="min" style={{ width: "100%", padding: "8px", borderRadius: "6px", border: "1px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "14px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                    <span style={{ color: "#64748b", fontSize: "12px" }}>≤ y ≤</span>
-                    <input value={curvedBonusAnswers.ranMax} onChange={e => setCurvedBonusAnswers(p => ({ ...p, ranMax: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkCurvedCalc()} placeholder="max" style={{ width: "100%", padding: "8px", borderRadius: "6px", border: "1px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "14px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                  </div>
-                </div>
-              </div>
-              <div style={{ fontSize: "9px", color: "#64748b", textAlign: "center", marginBottom: "12px" }}>🎯 Bonus question — +§100,000 reward</div>
-            </>}
-
-            {curvedCalcFeedback && (<div style={{ padding: "10px 14px", borderRadius: "8px", marginBottom: "12px", fontSize: "12px", fontWeight: 600, position: "relative", background: curvedCalcFeedback.type === "success" ? "#4ade8015" : "#ef444415", border: `1px solid ${curvedCalcFeedback.type === "success" ? "#4ade8040" : "#ef444440"}`, color: curvedCalcFeedback.type === "success" ? "#4ade80" : "#fca5a5" }}>{curvedCalcFeedback.msg}</div>)}
-            {curvedCalcAttempts > 0 && <div style={{ fontSize: "10px", color: "#ef4444", textAlign: "center", marginBottom: "8px", position: "relative" }}>Attempts: {curvedCalcAttempts}</div>}
-
-            <div style={{ display: "flex", gap: "8px", position: "relative" }}>
-              <button onClick={checkCurvedCalc} style={{ ...S.popupBtn, flex: 1, textAlign: "center", background: "linear-gradient(135deg, #a78bfa, #7c3aed)" }}>
-                {curvedBonusPhase === 0 ? "✓ Submit Equation" : curvedBonusPhase === 1 ? "✓ Submit Linearisation" : "✓ Submit Domain & Range"}
-              </button>
-              {curvedBonusPhase > 0 && <button onClick={() => { setShowCurvedCalc(false); setPendingCurved(null); setCurvedBonusPhase(0); }} style={{ padding: "10px 16px", borderRadius: "10px", background: "#1a2a4a", border: "1px solid #2a3a5e", color: "#94a3b8", cursor: "pointer", fontWeight: 600, fontSize: "12px", fontFamily: "inherit" }}>Skip Bonus</button>}
-              {curvedBonusPhase === 0 && <button onClick={() => { setShowCurvedCalc(false); setPendingCurved(null); setCurvedRoadStart(null); setCurvedBonusPhase(0); }} style={{ padding: "10px 16px", borderRadius: "10px", background: "#1a2a4a", border: "1px solid #2a3a5e", color: "#94a3b8", cursor: "pointer", fontWeight: 600, fontSize: "12px", fontFamily: "inherit" }}>Cancel</button>}
-            </div>
-            <div style={{ textAlign: "center", marginTop: "8px", fontSize: "9px", color: "#475569", position: "relative" }}>⚠ Each wrong answer costs 10% of your treasury</div>
-          </div>
-        </div>
+        <CurvedRoadCalc
+          drag={dragCurved}
+          pendingCurved={pendingCurved}
+          phase={curvedBonusPhase}
+          answersAB={curvedAnswers}
+          setAnswersAB={setCurvedAnswers}
+          bonusAnswers={curvedBonusAnswers}
+          setBonusAnswers={setCurvedBonusAnswers}
+          onSubmit={checkCurvedCalc}
+          feedback={curvedCalcFeedback}
+          attempts={curvedCalcAttempts}
+          onSkip={() => { setShowCurvedCalc(false); setPendingCurved(null); setCurvedBonusPhase(0); }}
+          onCancel={() => { setShowCurvedCalc(false); setPendingCurved(null); setCurvedRoadStart(null); setCurvedBonusPhase(0); }}
+        />
       )}
 
       {/* Pollution Calculation Challenge */}
       {showPollutionCalc && !pollCalcPassed && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "540px", textAlign: "left" , ...dragPoll.style}}>
-            <div {...dragPoll.handleProps} style={{...S.dragHandle, ...dragPoll.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "16px", position: "relative" }}>
-              <div style={{ fontSize: "48px", marginBottom: "4px" }}>☣️</div>
-              <div style={{ ...S.popupBadge, background: "#f59e0b20", borderColor: "#f59e0b40", color: "#fb923c" }}>POLLUTION ANALYSIS</div>
-              <div style={{ display: "inline-block", padding: "2px 10px", borderRadius: "6px", marginTop: "6px", fontSize: "10px", fontWeight: 700, background: mathDifficulty === "easy" ? "#22c55e20" : mathDifficulty === "hard" ? "#ef444420" : "#f59e0b20", color: mathDifficulty === "easy" ? "#4ade80" : mathDifficulty === "hard" ? "#fca5a5" : "#fbbf24" }}>
-                {mathDifficulty === "easy" ? "🟢 Easy — Loci Identification" : mathDifficulty === "hard" ? "🔴 Hard — Probability Function" : "🟡 Medium — Quadratic Model"}{pollCalcPhase > 1 && ` — Step ${pollCalcPhase}`}
-              </div>
-            </div>
-
-            {/* Pollution data */}
-            <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "12px", marginBottom: "16px", border: "1px solid #1a2a4a", position: "relative" }}>
-              <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "1px", marginBottom: "8px" }}>Garbage Disposal Pollution Radii</div>
-              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-                <div style={{ flex: 1, minWidth: "100px", padding: "8px", borderRadius: "6px", background: "#1a2a4a40", textAlign: "center" }}>
-                  <div style={{ fontSize: "18px" }}>🔊</div>
-                  <div style={{ fontSize: "11px", fontWeight: 700, color: "#fb923c" }}>Noise</div>
-                  <div style={{ fontSize: "14px", fontWeight: 800, color: "#fbbf24", fontFamily: "monospace" }}>0.2 km</div>
-                  <div style={{ fontSize: "9px", color: "#64748b" }}>200m radius</div>
-                </div>
-                <div style={{ flex: 1, minWidth: "100px", padding: "8px", borderRadius: "6px", background: "#1a2a4a40", textAlign: "center" }}>
-                  <div style={{ fontSize: "18px" }}>🟤</div>
-                  <div style={{ fontSize: "11px", fontWeight: 700, color: "#a16207" }}>Ground</div>
-                  <div style={{ fontSize: "14px", fontWeight: 800, color: "#fbbf24", fontFamily: "monospace" }}>1.0 km</div>
-                  <div style={{ fontSize: "9px", color: "#64748b" }}>1000m radius</div>
-                </div>
-                <div style={{ flex: 1, minWidth: "100px", padding: "8px", borderRadius: "6px", background: "#1a2a4a40", textAlign: "center" }}>
-                  <div style={{ fontSize: "18px" }}>💨</div>
-                  <div style={{ fontSize: "11px", fontWeight: 700, color: "#ef4444" }}>Air</div>
-                  <div style={{ fontSize: "14px", fontWeight: 800, color: "#fbbf24", fontFamily: "monospace" }}>0.9 km</div>
-                  <div style={{ fontSize: "9px", color: "#64748b" }}>900m radius</div>
-                </div>
-              </div>
-              <div style={{ marginTop: "8px", fontSize: "9px", color: "#94a3b8" }}>
-                🚰 Water & Sewage pipes also generate noise pollution: 0.3 km (300m) from each endpoint
-              </div>
-            </div>
-
-            {/* EASY: Loci sketch identification */}
-            {mathDifficulty === "easy" && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-                Identify the <strong style={{ color: "#facc15" }}>three pollution loci</strong> around your garbage disposal. Each type creates a circular exclusion zone where <strong style={{ color: "#ef4444" }}>housing should not be built</strong>.
-              </p>
-
-              <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginBottom: "16px", position: "relative" }}>
-                <div style={{ fontSize: "11px", fontWeight: 700, color: "#94a3b8", marginBottom: "4px" }}>Tick each locus you can identify on the map:</div>
-                {[
-                  { key: "noise", icon: "🔊", label: "Noise locus", desc: "Circle with radius 200m (2 grid cells) from the garbage disposal", color: "#fb923c" },
-                  { key: "ground", icon: "🟤", label: "Ground contamination locus", desc: "Circle with radius 1000m (10 grid cells) — the largest zone", color: "#a16207" },
-                  { key: "air", icon: "💨", label: "Air pollution locus", desc: "Circle with radius 900m (9 grid cells) from the garbage disposal", color: "#ef4444" },
-                ].map(l => (
-                  <button key={l.key} onClick={() => setPollLociConfirmed(p => ({ ...p, [l.key]: !p[l.key] }))} style={{
-                    display: "flex", alignItems: "center", gap: "10px", padding: "10px 14px", borderRadius: "8px", width: "100%",
-                    border: pollLociConfirmed[l.key] ? `2px solid ${l.color}` : "2px solid #2a3a5e",
-                    background: pollLociConfirmed[l.key] ? `${l.color}15` : "#080f1e",
-                    cursor: "pointer", textAlign: "left", transition: "all 0.15s",
-                  }}>
-                    <div style={{ width: "24px", height: "24px", borderRadius: "6px", background: pollLociConfirmed[l.key] ? l.color : "#2a3a5e", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 800, fontSize: "12px", flexShrink: 0 }}>
-                      {pollLociConfirmed[l.key] ? "✓" : ""}
-                    </div>
-                    <div>
-                      <div style={{ fontSize: "12px", fontWeight: 700, color: pollLociConfirmed[l.key] ? l.color : "#94a3b8" }}>{l.icon} {l.label}</div>
-                      <div style={{ fontSize: "9px", color: "#64748b", marginTop: "2px" }}>{l.desc}</div>
-                    </div>
-                  </button>
-                ))}
-              </div>
-
-              <div style={{ background: "#f59e0b10", border: "1px solid #f59e0b30", borderRadius: "6px", padding: "8px", marginBottom: "16px", fontSize: "9px", color: "#f59e0b", fontFamily: "monospace", lineHeight: 1.5 }}>
-                💡 A locus is a set of points that satisfy a condition.<br/>
-                Each pollution type creates a circular locus: all points within distance r from the source.<br/>
-                Housing must be placed OUTSIDE the largest locus (ground: 1000m) to be safe.
-              </div>
-            </>}
-
-            {/* MEDIUM Phase 1: Find k */}
-            {mathDifficulty === "medium" && pollCalcPhase === 1 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-                The number of people that get sick in a pollution zone (<strong style={{ color: "#ef4444" }}>y</strong>) follows the model:
-              </p>
-              <div style={{ textAlign: "center", padding: "14px", background: "#0a0f1a", borderRadius: "10px", border: "1px solid #1a2a4a", marginBottom: "16px", position: "relative" }}>
-                <div style={{ fontSize: "22px", fontWeight: 800, color: "#facc15", fontFamily: "monospace" }}>y = kx²</div>
-                <div style={{ fontSize: "11px", color: "#94a3b8", marginTop: "6px" }}>where x = distance in metres inside the pollution locus boundary</div>
-              </div>
-              <div style={{ background: "#1a2a4a40", borderRadius: "8px", padding: "10px", marginBottom: "16px" }}>
-                <div style={{ fontSize: "12px", color: "#e2e8f0", lineHeight: 1.6 }}>
-                  <strong style={{ color: "#22d3ee" }}>Given:</strong> 40 people got sick when they were <strong style={{ color: "#facc15" }}>10 metres</strong> inside the pollution locus.
-                </div>
-                <div style={{ fontSize: "12px", color: "#fb923c", fontWeight: 700, marginTop: "6px" }}>Find the value of k.</div>
-              </div>
-              <div style={{ marginBottom: "16px" }}>
-                <label style={{ fontSize: "11px", fontWeight: 700, color: "#facc15", display: "block", marginBottom: "4px" }}>k =</label>
-                <input value={pollCalcAnswers.k} onChange={e => setPollCalcAnswers(p => ({ ...p, k: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkPollutionCalc()} placeholder="?" style={{ width: "100%", padding: "12px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "20px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-              </div>
-              <div style={{ fontSize: "9px", color: "#64748b", fontFamily: "monospace", marginBottom: "16px" }}>💡 Substitute y = 40 and x = 10 into y = kx², then solve for k</div>
-            </>}
-
-            {/* MEDIUM Phase 2: Predict sick at 21m */}
-            {mathDifficulty === "medium" && pollCalcPhase === 2 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-                Using <strong style={{ color: "#facc15" }}>k = {POLL_K}</strong>, how many people would get sick if they were <strong style={{ color: "#ef4444" }}>21 metres</strong> inside the pollution locus?
-              </p>
-              <div style={{ textAlign: "center", padding: "14px", background: "#0a0f1a", borderRadius: "10px", border: "1px solid #1a2a4a", marginBottom: "16px", position: "relative" }}>
-                <div style={{ fontSize: "22px", fontWeight: 800, color: "#facc15", fontFamily: "monospace" }}>y = {POLL_K}x²</div>
-                <div style={{ fontSize: "12px", color: "#94a3b8", marginTop: "6px" }}>x = 21 metres, y = ?</div>
-              </div>
-              <div style={{ marginBottom: "16px" }}>
-                <label style={{ fontSize: "11px", fontWeight: 700, color: "#ef4444", display: "block", marginBottom: "4px" }}>Number of sick people =</label>
-                <input value={pollCalcAnswers.sick} onChange={e => setPollCalcAnswers(p => ({ ...p, sick: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkPollutionCalc()} placeholder="?" style={{ width: "100%", padding: "12px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "20px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-              </div>
-              <div style={{ fontSize: "9px", color: "#64748b", fontFamily: "monospace", marginBottom: "16px" }}>💡 Substitute x = 21 into y = {POLL_K} × x². Accept 1 d.p.</div>
-            </>}
-
-            {/* HARD: Integration of probability function */}
-            {mathDifficulty === "hard" && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "12px", position: "relative" }}>
-                The probability density of someone being sick in a pollution locus is represented by:
-              </p>
-              <div style={{ textAlign: "center", padding: "14px", background: "#0a0f1a", borderRadius: "10px", border: "1px solid #ef444440", marginBottom: "6px", position: "relative" }}>
-                <div style={{ fontSize: "20px", fontWeight: 800, color: "#fca5a5", fontFamily: "monospace" }}>F(X) = 0.5X(1 − X)</div>
-                <div style={{ fontSize: "11px", color: "#94a3b8", marginTop: "6px", fontFamily: "monospace" }}>0 &lt; X &lt; 1</div>
-                <div style={{ fontSize: "11px", color: "#64748b", fontFamily: "monospace" }}>F(X) = 0 otherwise</div>
-                <div style={{ fontSize: "11px", color: "#fb923c", marginTop: "8px" }}>X represents the distance (km) inside the pollution locus boundary</div>
-              </div>
-              <div style={{ background: "#1a2a4a40", borderRadius: "8px", padding: "12px", marginBottom: "16px" }}>
-                <div style={{ fontSize: "12px", color: "#e2e8f0", lineHeight: 1.8 }}>
-                  If there are <strong style={{ color: "#22d3ee" }}>100 people</strong> in the pollution locus, how many are estimated to be sick <strong style={{ color: "#facc15" }}>0.2 km</strong> from the locus boundary?
-                </div>
-                <div style={{ fontSize: "11px", color: "#94a3b8", marginTop: "10px", lineHeight: 1.8 }}>
-                  <strong style={{ color: "#c084fc" }}>Steps:</strong><br/>
-                  1. Expand F(X) = 0.5X(1 − X)<br/>
-                  2. Integrate to get the cumulative function<br/>
-                  3. Evaluate with boundaries [0, 0.2]<br/>
-                  4. Multiply by 100 to get the expected number
-                </div>
-              </div>
-              <div style={{ marginBottom: "16px" }}>
-                <label style={{ fontSize: "11px", fontWeight: 700, color: "#c084fc", display: "block", marginBottom: "4px" }}>Expected number of sick people =</label>
-                <input value={pollCalcAnswers.hard} onChange={e => setPollCalcAnswers(p => ({ ...p, hard: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkPollutionCalc()} placeholder="e.g. 0.87" style={{ width: "100%", padding: "12px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "20px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-              </div>
-              <div style={{ fontSize: "9px", color: "#64748b", fontFamily: "monospace", marginBottom: "16px", lineHeight: 1.6 }}>
-                💡 0.5X(1−X) = 0.5X − 0.5X²<br/>
-                ∫(0.5X − 0.5X²)dX = 0.25X² − X³/6<br/>
-                Evaluate at [0, 0.2], then × 100
-              </div>
-            </>}
-
-            {pollCalcFeedback && (<div style={{ padding: "10px 14px", borderRadius: "8px", marginBottom: "12px", fontSize: "12px", fontWeight: 600, position: "relative", background: pollCalcFeedback.type === "success" ? "#4ade8015" : "#ef444415", border: `1px solid ${pollCalcFeedback.type === "success" ? "#4ade8040" : "#ef444440"}`, color: pollCalcFeedback.type === "success" ? "#4ade80" : "#fca5a5" }}>{pollCalcFeedback.msg}</div>)}
-            {pollCalcAttempts > 0 && <div style={{ fontSize: "10px", color: "#ef4444", textAlign: "center", marginBottom: "8px", position: "relative" }}>Attempts: {pollCalcAttempts}</div>}
-
-            <button onClick={checkPollutionCalc} style={{ ...S.popupBtn, width: "100%", textAlign: "center", background: "linear-gradient(135deg, #f59e0b, #d97706)" }}>
-              {mathDifficulty === "easy" ? "✓ Confirm Loci" : pollCalcPhase === 1 && mathDifficulty === "medium" ? "✓ Submit k" : "✓ Submit Answer"}
-            </button>
-            {mathDifficulty === "medium" && pollCalcPhase === 1 && <div style={{ textAlign: "center", marginTop: "6px", fontSize: "9px", color: "#f59e0b", position: "relative" }}>Step 1 of 2</div>}
-            <div style={{ textAlign: "center", marginTop: "6px", fontSize: "9px", color: "#475569", position: "relative" }}>⚠ Each wrong answer costs 10% of your treasury</div>
-          </div>
-        </div>
+        <PollutionCalc
+          drag={dragPoll}
+          difficulty={mathDifficulty}
+          phase={pollCalcPhase}
+          lociConfirmed={pollLociConfirmed}
+          setLociConfirmed={setPollLociConfirmed}
+          answers={pollCalcAnswers}
+          setAnswers={setPollCalcAnswers}
+          pollK={POLL_K}
+          feedback={pollCalcFeedback}
+          attempts={pollCalcAttempts}
+          onSubmit={checkPollutionCalc}
+        />
       )}
 
       {/* Job Sector Randomizer */}
       {showJobRandom && !jobResultLocked && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "480px" , ...dragJob.style }}>
-            <div {...dragJob.handleProps} style={{...S.dragHandle, ...dragJob.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "12px", position: "relative" }}>
-              <div style={{ fontSize: "48px", marginBottom: "4px" }}>💼</div>
-              <div style={{ ...S.popupBadge, background: "#eab30820", borderColor: "#eab30840", color: "#eab308" }}>
-                {jobResult ? "JOB SECTOR RESULT" : "JOB SECTOR LOTTERY"}
-              </div>
-            </div>
-
-            <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "6px", textAlign: "center", position: "relative" }}>
-              {jobResult
-                ? `Your city's economy is dominated by the ${jobResult.dominant} sector!`
-                : "What type of economy will your city develop? The ball decides your fate!"}
-            </p>
-
-            {civics === "technologist" && !jobResult && (
-              <div style={{ textAlign: "center", fontSize: "10px", color: "#c084fc", marginBottom: "12px", fontWeight: 600, position: "relative" }}>
-                ⚡ Technologist bonus: Tertiary sector has 50% probability
-              </div>
-            )}
-
-            {/* The bar */}
-            <div style={{ position: "relative", marginBottom: "20px" }}>
-              {/* Section labels above */}
-              <div style={{ display: "flex", marginBottom: "4px", position: "relative" }}>
-                {jobBarSections.map(s => (
-                  <div key={s.id} style={{ flex: s.end - s.start, textAlign: "center", fontSize: "9px", fontWeight: 700, color: s.color }}>
-                    {s.label} ({Math.round((s.end - s.start) * 100)}%)
-                  </div>
-                ))}
-              </div>
-
-              {/* Bar */}
-              <div style={{ display: "flex", height: "60px", borderRadius: "12px", overflow: "hidden", border: "2px solid #2a3a5e", position: "relative" }}>
-                {jobBarSections.map(s => (
-                  <div key={s.id} style={{
-                    flex: s.end - s.start,
-                    background: `linear-gradient(180deg, ${s.color}cc 0%, ${s.color}88 100%)`,
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    borderRight: s.id !== "tertiary" ? "2px solid #1a2a4a" : "none",
-                    transition: "opacity 0.3s",
-                    opacity: jobResult ? (jobResult.dominant === s.id ? 1 : 0.3) : 1,
-                  }}>
-                    <span style={{ fontSize: "16px", fontWeight: 900, color: "#fff", textShadow: "0 1px 4px rgba(0,0,0,0.5)" }}>
-                      {s.id === "primary" ? "🏭" : s.id === "secondary" ? "🔧" : "💻"}
-                    </span>
-                  </div>
-                ))}
-
-                {/* Ball */}
-                <div style={{
-                  position: "absolute", top: "50%", left: `${jobBallPos * 100}%`,
-                  transform: "translate(-50%, -50%)",
-                  width: "28px", height: "28px", borderRadius: "50%",
-                  background: "radial-gradient(circle at 40% 35%, #fff 0%, #e2e8f0 40%, #94a3b8 100%)",
-                  boxShadow: "0 2px 8px rgba(0,0,0,0.5), inset 0 -2px 4px rgba(0,0,0,0.2)",
-                  border: "2px solid #fff",
-                  transition: jobTimerRunning ? "left 0.05s linear" : "left 0.3s ease-out",
-                  zIndex: 2,
-                }} />
-              </div>
-
-              {/* Timer bar */}
-              {!jobResult && (
-                <div style={{ marginTop: "8px", height: "6px", background: "#1a2a4a", borderRadius: "3px", overflow: "hidden" }}>
-                  <div style={{ height: "100%", background: jobTimeLeft > 0.5 ? "#22c55e" : jobTimeLeft > 0.2 ? "#eab308" : "#ef4444", borderRadius: "3px", width: `${(jobTimeLeft / 1) * 100}%`, transition: "width 0.1s linear" }} />
-                </div>
-              )}
-              {!jobResult && <div style={{ textAlign: "center", marginTop: "4px", fontSize: "20px", fontWeight: 900, color: jobTimeLeft > 0.5 ? "#22c55e" : jobTimeLeft > 0.2 ? "#eab308" : "#ef4444", fontFamily: "monospace", position: "relative" }}>
-                {jobTimerRunning ? jobTimeLeft.toFixed(1) + "s" : "Ready"}
-              </div>}
-            </div>
-
-            {/* Result display */}
-            {jobResult && (
-              <div style={{ background: "#0a0f1a", borderRadius: "12px", padding: "16px", border: "1px solid #1a2a4a", marginBottom: "16px", position: "relative" }}>
-                <div style={{ textAlign: "center", marginBottom: "12px" }}>
-                  <span style={{ fontSize: "14px", fontWeight: 800, color: jobBarSections.find(s => s.id === jobResult.dominant)?.color }}>
-                    {jobResult.dominant === "primary" ? "🏭 Primary" : jobResult.dominant === "secondary" ? "🔧 Secondary" : "💻 Tertiary"} sector dominates at 60%
-                  </span>
-                </div>
-                <div style={{ display: "flex", gap: "8px" }}>
-                  {["primary", "secondary", "tertiary"].map(s => {
-                    const section = jobBarSections.find(b => b.id === s);
-                    const pct = jobResult.split[s];
-                    const count = Math.round(demographics.adults * pct / 100);
-                    return (
-                      <div key={s} style={{ flex: 1, padding: "10px", borderRadius: "8px", background: `${section.color}15`, border: `1px solid ${section.color}40`, textAlign: "center" }}>
-                        <div style={{ fontSize: "10px", fontWeight: 700, color: section.color }}>{s === "primary" ? "🏭 Primary" : s === "secondary" ? "🔧 Secondary" : "💻 Tertiary"}</div>
-                        <div style={{ fontSize: "24px", fontWeight: 900, color: section.color, fontFamily: "monospace" }}>{pct}%</div>
-                        <div style={{ fontSize: "9px", color: "#94a3b8" }}>{count} workers</div>
-                        <div style={{ fontSize: "8px", color: "#64748b", marginTop: "2px" }}>{s === "primary" ? "Farming, Mining" : s === "secondary" ? "Manufacturing" : "Services, Tech"}</div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            {/* Probability explanation */}
-            {!jobResult && !jobTimerRunning && (
-              <div style={{ background: "#1a2a4a40", borderRadius: "8px", padding: "8px 10px", marginBottom: "12px", fontSize: "9px", color: "#c084fc", fontFamily: "monospace", lineHeight: 1.5, position: "relative" }}>
-                💡 Probability: Each section's width = its probability.<br/>
-                {civics === "technologist"
-                  ? "Technologist civic: P(Tertiary) = 0.50, P(Primary) = P(Secondary) = 0.25"
-                  : "Equal distribution: P(Primary) = P(Secondary) = P(Tertiary) = 0.33"}
-                <br/>The ball moves randomly — where it stops is weighted by section size.
-              </div>
-            )}
-
-            <div style={{ display: "flex", gap: "8px", position: "relative" }}>
-              {!jobTimerRunning && !jobResult && (
-                <button onClick={() => { setJobTimerRunning(true); setJobTimeLeft(1); setJobBallPos(0.5); }} style={{ ...S.popupBtn, flex: 1, textAlign: "center", background: "linear-gradient(135deg, #eab308, #ca8a04)" }}>
-                  🎲 Spin!
-                </button>
-              )}
-              {jobResult && (
-                <button onClick={() => { setJobResultLocked(true); setShowJobRandom(false); addNotification(`💼 Economy set: ${jobResult.dominant} sector dominant (${jobResult.split.primary}/${jobResult.split.secondary}/${jobResult.split.tertiary})`); }} style={{ ...S.popupBtn, flex: 1, textAlign: "center" }}>
-                  Accept & Continue →
-                </button>
-              )}
-            </div>
-          </div>
-        </div>
+        <JobLottery
+          drag={dragJob}
+          jobResult={jobResult}
+          civics={civics}
+          jobBarSections={jobBarSections}
+          jobBallPos={jobBallPos}
+          jobTimerRunning={jobTimerRunning}
+          jobTimeLeft={jobTimeLeft}
+          demographics={demographics}
+          onSpin={() => { setJobTimerRunning(true); setJobTimeLeft(1); setJobBallPos(0.5); }}
+          onAccept={() => { setJobResultLocked(true); setShowJobRandom(false); addNotification(`💼 Economy set: ${jobResult.dominant} sector dominant (${jobResult.split.primary}/${jobResult.split.secondary}/${jobResult.split.tertiary})`); }}
+        />
       )}
 
       {/* Water Consumption Calculation */}
       {showWaterConsumption && !waterConsumptionPassed && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "560px", textAlign: "left", ...dragWater.style }}>
-            <div {...dragWater.handleProps} style={{...S.dragHandle, ...dragWater.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "16px", position: "relative" }}>
-              <div style={{ fontSize: "48px", marginBottom: "4px" }}>💧</div>
-              <div style={{ ...S.popupBadge, background: "#60a5fa20", borderColor: "#60a5fa40", color: "#60a5fa" }}>WATER CONSUMPTION</div>
-              <div style={{ display: "inline-block", padding: "2px 10px", borderRadius: "6px", marginTop: "6px", fontSize: "10px", fontWeight: 700, background: mathDifficulty === "easy" ? "#22c55e20" : mathDifficulty === "hard" ? "#ef444420" : "#f59e0b20", color: mathDifficulty === "easy" ? "#4ade80" : mathDifficulty === "hard" ? "#fca5a5" : "#fbbf24" }}>
-                {mathDifficulty === "easy" ? "🟢 Easy" : mathDifficulty === "hard" ? "🔴 Hard — Arithmetic Series" : "🟡 Medium"}
-              </div>
-            </div>
-
-            <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "12px", position: "relative" }}>
-              {mathDifficulty === "hard"
-                ? <>Due to increasing pipe distances, each additional building of the same type uses <strong style={{ color: "#fca5a5" }}>{WATER_SERIES_D} litres more</strong> per day than the previous one. Find the <strong style={{ color: "#60a5fa" }}>total daily consumption</strong>.</>
-                : <>Calculate your city's <strong style={{ color: "#60a5fa" }}>total daily water consumption</strong> in litres based on all placed buildings.</>}
-            </p>
-
-            <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "14px", marginBottom: "16px", border: "1px solid #1a2a4a", position: "relative" }}>
-              <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "1px", marginBottom: "10px" }}>
-                {mathDifficulty === "hard" ? "Series Data" : "Water Usage Rates"} (litres/day)
-              </div>
-
-              {mathDifficulty === "hard" ? (
-                <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-                  {waterCalcData.breakdown.map(b => (
-                    <div key={b.type} style={{ padding: "8px 10px", borderRadius: "6px", background: "#1a2a4a30" }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
-                        <span style={{ fontSize: "11px", fontWeight: 700, color: "#e2e8f0" }}>{b.name} <span style={{ color: "#64748b" }}>× {b.n}</span></span>
-                        <span style={{ fontSize: "9px", color: "#c084fc", fontFamily: "monospace" }}>a = {b.a}, d = {WATER_SERIES_D}, n = {b.n}</span>
-                      </div>
-                      <div style={{ fontSize: "9px", color: "#94a3b8", fontFamily: "monospace", lineHeight: 1.5 }}>
-                        1st: {b.a}L → 2nd: {b.a + WATER_SERIES_D}L → 3rd: {b.a + 2 * WATER_SERIES_D}L{b.n > 3 ? ` → ... → ${b.n}th: ${b.a + (b.n - 1) * WATER_SERIES_D}L` : ""}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px" }}>
-                  {waterCalcData.breakdown.map(b => (
-                    <div key={b.type} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px 8px", borderRadius: "4px", background: "#1a2a4a30", fontSize: "10px" }}>
-                      <span style={{ color: "#e2e8f0" }}>{b.name} <span style={{ color: "#64748b" }}>×{b.n}</span></span>
-                      <span style={{ color: "#60a5fa", fontFamily: "monospace", fontWeight: 700 }}>{b.a} L</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              <div style={{ marginTop: "10px", padding: "6px 8px", borderRadius: "6px", background: mathDifficulty === "hard" ? "#c084fc10" : "#60a5fa10", border: `1px solid ${mathDifficulty === "hard" ? "#c084fc30" : "#60a5fa30"}`, fontSize: "9px", color: mathDifficulty === "hard" ? "#c084fc" : "#60a5fa", fontFamily: "monospace", lineHeight: 1.6 }}>
-                {mathDifficulty === "hard" ? (<>
-                  💡 For each building type, use the arithmetic series formula:<br/>
-                  Sₙ = n/2 × (2a + (n − 1)d)<br/>
-                  where a = base usage, d = {WATER_SERIES_D}, n = count<br/>
-                  Then sum all building types together
-                </>) : (<>
-                  💡 Total = Σ (building count × water usage per building)
-                </>)}
-              </div>
-            </div>
-
-            <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "16px" }}>
-              <span style={{ fontSize: "13px", fontWeight: 700, color: "#60a5fa" }}>Total =</span>
-              <input value={waterConsumptionAnswer} onChange={e => setWaterConsumptionAnswer(e.target.value)} onKeyDown={e => e.key === "Enter" && checkWaterConsumption()} placeholder="litres/day" style={{ flex: 1, padding: "12px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "20px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} autoFocus />
-              <span style={{ fontSize: "11px", color: "#64748b" }}>L/day</span>
-            </div>
-
-            {waterConsumptionFeedback && (<div style={{ padding: "10px 14px", borderRadius: "8px", marginBottom: "12px", fontSize: "12px", fontWeight: 600, position: "relative", background: waterConsumptionFeedback.type === "success" ? "#4ade8015" : "#ef444415", border: `1px solid ${waterConsumptionFeedback.type === "success" ? "#4ade8040" : "#ef444440"}`, color: waterConsumptionFeedback.type === "success" ? "#4ade80" : "#fca5a5" }}>{waterConsumptionFeedback.msg}</div>)}
-
-            <button onClick={checkWaterConsumption} style={{ ...S.popupBtn, width: "100%", textAlign: "center", background: mathDifficulty === "hard" ? "linear-gradient(135deg, #ef4444, #dc2626)" : "linear-gradient(135deg, #60a5fa, #3b82f6)" }}>✓ Submit Total</button>
-            <div style={{ textAlign: "center", marginTop: "8px", fontSize: "9px", color: "#475569", position: "relative" }}>⚠ Each wrong answer costs 10% of your treasury</div>
-          </div>
-        </div>
+        <WaterConsumption
+          drag={dragWater}
+          difficulty={mathDifficulty}
+          seriesD={WATER_SERIES_D}
+          data={waterCalcData}
+          answer={waterConsumptionAnswer}
+          setAnswer={setWaterConsumptionAnswer}
+          onSubmit={checkWaterConsumption}
+          feedback={waterConsumptionFeedback}
+        />
       )}
 
       {/* Worker Sector Calculation */}
       {showWorkerCalc && !workerCalcPassed && jobResult && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "520px", textAlign: "left", ...dragWorker.style }}>
-            <div {...dragWorker.handleProps} style={{...S.dragHandle, ...dragWorker.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "16px", position: "relative" }}>
-              <div style={{ fontSize: "48px", marginBottom: "4px" }}>💼</div>
-              <div style={{ ...S.popupBadge, background: "#eab30820", borderColor: "#eab30840", color: "#eab308" }}>WORKER SECTOR ANALYSIS</div>
-              <div style={{ display: "inline-block", padding: "2px 10px", borderRadius: "6px", marginTop: "6px", fontSize: "10px", fontWeight: 700, background: mathDifficulty === "easy" ? "#22c55e20" : mathDifficulty === "hard" ? "#ef444420" : "#f59e0b20", color: mathDifficulty === "easy" ? "#4ade80" : mathDifficulty === "hard" ? "#fca5a5" : "#fbbf24" }}>
-                {mathDifficulty === "easy" ? "🟢 Easy" : mathDifficulty === "hard" ? "🔴 Hard" : "🟡 Medium"}{workerCalcPhase === 2 && " — Step 2"}{workerCalcPhase === 3 && ` — Step ${workerHardStep + 1}`}
-              </div>
-            </div>
-
-            {/* Phase 1: Calculate workers */}
-            {workerCalcPhase === 1 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-                Your city's economy is <strong style={{ color: "#eab308" }}>{jobResult.dominant}</strong> sector dominant. Calculate how many <strong style={{ color: "#60a5fa" }}>adult workers</strong> are employed in each sector.
-              </p>
-
-              <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "14px", marginBottom: "16px", border: "1px solid #1a2a4a", position: "relative" }}>
-                <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "1px", marginBottom: "10px" }}>Given Data</div>
-                <div style={{ display: "flex", gap: "8px", marginBottom: "10px" }}>
-                  <div style={{ flex: 1, padding: "8px", borderRadius: "6px", background: "#1a2a4a40", textAlign: "center" }}>
-                    <div style={{ fontSize: "9px", color: "#64748b" }}>Total Adults</div>
-                    <div style={{ fontSize: "22px", fontWeight: 800, color: "#60a5fa", fontFamily: "monospace" }}>{workerCalcCorrect.totalAdults}</div>
-                    <div style={{ fontSize: "8px", color: "#64748b" }}>Only adults work — not children or elderly</div>
-                  </div>
-                </div>
-                <div style={{ display: "flex", gap: "6px" }}>
-                  {[
-                    { id: "primary", label: "Primary", icon: "🌾", desc: "Farming, mining, fishing", color: "#22c55e" },
-                    { id: "secondary", label: "Secondary", icon: "🏭", desc: "Manufacturing, construction", color: "#3b82f6" },
-                    { id: "tertiary", label: "Tertiary", icon: "🏪", desc: "Services, education, research", color: "#a855f7" },
-                  ].map(s => (
-                    <div key={s.id} style={{ flex: 1, padding: "8px", borderRadius: "6px", background: jobResult.dominant === s.id ? `${s.color}15` : "#1a2a4a40", border: `1px solid ${jobResult.dominant === s.id ? s.color + "40" : "#1a2a4a"}`, textAlign: "center" }}>
-                      <div style={{ fontSize: "16px" }}>{s.icon}</div>
-                      <div style={{ fontSize: "10px", fontWeight: 700, color: s.color }}>{s.label}</div>
-                      <div style={{ fontSize: "22px", fontWeight: 800, color: "#fbbf24", fontFamily: "monospace" }}>{jobResult.split[s.id]}%</div>
-                      <div style={{ fontSize: "7px", color: "#64748b" }}>{s.desc}</div>
-                    </div>
-                  ))}
-                </div>
-                <div style={{ marginTop: "10px", padding: "6px 8px", borderRadius: "6px", background: "#f59e0b10", border: "1px solid #f59e0b30", fontSize: "9px", color: "#f59e0b", fontFamily: "monospace", lineHeight: 1.5 }}>
-                  💡 Workers in sector = Total adults × sector percentage ÷ 100
-                </div>
-              </div>
-
-              <div style={{ fontSize: "11px", fontWeight: 700, color: "#94a3b8", marginBottom: "8px" }}>How many adult workers in each sector?</div>
-              <div style={{ display: "flex", gap: "10px", marginBottom: "16px", position: "relative" }}>
-                {[
-                  { k: "primary", l: "🌾 Primary", c: "#22c55e", pct: jobResult.split.primary },
-                  { k: "secondary", l: "🏭 Secondary", c: "#3b82f6", pct: jobResult.split.secondary },
-                  { k: "tertiary", l: "🏪 Tertiary", c: "#a855f7", pct: jobResult.split.tertiary },
-                ].map(f => (
-                  <div key={f.k} style={{ flex: 1 }}>
-                    <label style={{ fontSize: "10px", fontWeight: 700, color: f.c, display: "block", marginBottom: "4px" }}>{f.l} ({f.pct}%)</label>
-                    <input value={workerCalcAnswers[f.k]} onChange={e => setWorkerCalcAnswers(p => ({ ...p, [f.k]: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkWorkerCalc()} placeholder="?" style={{ width: "100%", padding: "10px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                  </div>
-                ))}
-              </div>
-            </>}
-
-            {/* Phase 4: Collecting like terms (easy) */}
-            {workerCalcPhase === 4 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "14px", position: "relative" }}>
-                Now write it with <strong style={{ color: "#a855f7" }}>algebra</strong>. Let <strong style={{ fontFamily: "monospace", color: "#22c55e" }}>p</strong> = primary jobs, <strong style={{ fontFamily: "monospace", color: "#3b82f6" }}>s</strong> = secondary jobs and <strong style={{ fontFamily: "monospace", color: "#a855f7" }}>t</strong> = tertiary jobs.
-              </p>
-              <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "14px", marginBottom: "14px", border: "1px solid #1a2a4a", position: "relative" }}>
-                <label style={{ fontSize: "12px", fontWeight: 700, color: "#94a3b8", display: "block", marginBottom: "6px" }}>1. Write an expression for the total number of jobs you have filled.</label>
-                <input value={workerAlgAnswers.total} onChange={e => setWorkerAlgAnswers(pp => ({ ...pp, total: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkWorkerCalc()} placeholder="e.g. p + s + t" style={{ width: "100%", padding: "10px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "16px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none", marginBottom: "12px" }} />
-                <label style={{ fontSize: "12px", fontWeight: 700, color: "#94a3b8", display: "block", marginBottom: "6px" }}>2. How would you represent a worker who can do <strong style={{ color: "#fbbf24" }}>both</strong> a primary and a secondary job?</label>
-                <input value={workerAlgAnswers.both} onChange={e => setWorkerAlgAnswers(pp => ({ ...pp, both: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkWorkerCalc()} placeholder="e.g. p + s" style={{ width: "100%", padding: "10px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "16px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                <div style={{ marginTop: "10px", padding: "6px 8px", borderRadius: "6px", background: "#a855f710", border: "1px solid #a855f730", fontSize: "9px", color: "#c4b5fd", fontFamily: "monospace", lineHeight: 1.5 }}>
-                  💡 Collecting like terms: add the quantities of the same kind together.
-                </div>
-              </div>
-            </>}
-
-            {/* Phase 5: Venn diagram (easy) */}
-            {workerCalcPhase === 5 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "12px", position: "relative" }}>
-                Some workers are trained in more than one sector. This Venn diagram shows how many workers can do <strong style={{ color: "#22c55e" }}>primary</strong> jobs, <strong style={{ color: "#3b82f6" }}>secondary</strong> jobs, or both.
-              </p>
-              <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "10px", marginBottom: "12px", border: "1px solid #1a2a4a", position: "relative", display: "flex", justifyContent: "center" }}>
-                <svg viewBox="0 0 320 185" style={{ width: "100%", maxWidth: "320px" }}>
-                  <circle cx="120" cy="100" r="72" fill="#22c55e22" stroke="#22c55e" strokeWidth="2" />
-                  <circle cx="200" cy="100" r="72" fill="#3b82f622" stroke="#3b82f6" strokeWidth="2" />
-                  <text x="78" y="30" fill="#22c55e" fontSize="13" fontWeight="800" textAnchor="middle">Primary</text>
-                  <text x="242" y="30" fill="#3b82f6" fontSize="13" fontWeight="800" textAnchor="middle">Secondary</text>
-                  <text x="82" y="107" fill="#e2e8f0" fontSize="22" fontWeight="800" textAnchor="middle">{vennWorkers.onlyP}</text>
-                  <text x="160" y="107" fill="#fbbf24" fontSize="22" fontWeight="800" textAnchor="middle">{vennWorkers.both}</text>
-                  <text x="238" y="107" fill="#e2e8f0" fontSize="22" fontWeight="800" textAnchor="middle">{vennWorkers.onlyS}</text>
-                  <text x="160" y="178" fill="#64748b" fontSize="10" textAnchor="middle">Neither: {vennWorkers.neither}</text>
-                </svg>
-              </div>
-              <div style={{ display: "flex", gap: "10px", marginBottom: "12px", position: "relative" }}>
-                <div style={{ flex: 1 }}>
-                  <label style={{ fontSize: "10px", fontWeight: 700, color: "#22c55e", display: "block", marginBottom: "4px" }}>How many can do a primary job?</label>
-                  <input value={workerVennAnswers.primary} onChange={e => setWorkerVennAnswers(pp => ({ ...pp, primary: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkWorkerCalc()} placeholder="?" style={{ width: "100%", padding: "10px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                </div>
-                <div style={{ flex: 1 }}>
-                  <label style={{ fontSize: "10px", fontWeight: 700, color: "#a855f7", display: "block", marginBottom: "4px" }}>How many can do at least one job?</label>
-                  <input value={workerVennAnswers.atLeastOne} onChange={e => setWorkerVennAnswers(pp => ({ ...pp, atLeastOne: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkWorkerCalc()} placeholder="?" style={{ width: "100%", padding: "10px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                </div>
-              </div>
-            </>}
-
-            {/* Phase 2: Production scaling (medium) */}
-            {workerCalcPhase === 2 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-                Using the workers you calculated, work out each sector's <strong style={{ color: "#eab308" }}>daily production</strong>.
-              </p>
-
-              <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "14px", marginBottom: "16px", border: "1px solid #1a2a4a", position: "relative" }}>
-                <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "1px", marginBottom: "10px" }}>Production Rates & Your Workers</div>
-                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-                  {[
-                    { id: "primary", label: "Primary", icon: "🌾", color: "#22c55e" },
-                    { id: "secondary", label: "Secondary", icon: "🏭", color: "#3b82f6" },
-                    { id: "tertiary", label: "Tertiary", icon: "🏪", color: "#a855f7" },
-                  ].map(s => {
-                    const prod = SECTOR_PRODUCTION[s.id];
-                    return (
-                      <div key={s.id} style={{ padding: "10px", borderRadius: "8px", background: "#1a2a4a40", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                        <div>
-                          <div style={{ fontSize: "11px", fontWeight: 700, color: s.color }}>{s.icon} {s.label}</div>
-                          <div style={{ fontSize: "10px", color: "#94a3b8", marginTop: "2px" }}>{prod.per} workers produce <strong style={{ color: "#fbbf24" }}>{prod.rate} {prod.unit}</strong> of {prod.material} per day{prod.divisor ? <span style={{ color: "#fb923c" }}> (÷ {prod.divisor})</span> : ""}</div>
-                        </div>
-                        <div style={{ textAlign: "right" }}>
-                          <div style={{ fontSize: "9px", color: "#64748b" }}>Your workers</div>
-                          <div style={{ fontSize: "16px", fontWeight: 800, color: s.color, fontFamily: "monospace" }}>{workerCalcCorrect[s.id]}</div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-                <div style={{ marginTop: "10px", padding: "6px 8px", borderRadius: "6px", background: "#f59e0b10", border: "1px solid #f59e0b30", fontSize: "9px", color: "#f59e0b", fontFamily: "monospace", lineHeight: 1.5 }}>
-                  💡 Daily output = (Your workers ÷ {SECTOR_PRODUCTION.primary.per}) × rate per {SECTOR_PRODUCTION.primary.per} workers<br/>
-                  🏪 Tertiary: then ÷ {SECTOR_PRODUCTION.tertiary.divisor} to convert to research points
-                </div>
-              </div>
-
-              <div style={{ fontSize: "11px", fontWeight: 700, color: "#94a3b8", marginBottom: "8px" }}>How much does each sector produce per day?</div>
-              <div style={{ display: "flex", gap: "10px", marginBottom: "16px", position: "relative" }}>
-                {[
-                  { k: "primary", l: "🌾 kg", c: "#22c55e" },
-                  { k: "secondary", l: "🏭 units", c: "#3b82f6" },
-                  { k: "tertiary", l: "🏪 RP", c: "#a855f7" },
-                ].map(f => (
-                  <div key={f.k} style={{ flex: 1 }}>
-                    <label style={{ fontSize: "10px", fontWeight: 700, color: f.c, display: "block", marginBottom: "4px" }}>{f.l}</label>
-                    <input value={workerProdAnswers[f.k]} onChange={e => setWorkerProdAnswers(p => ({ ...p, [f.k]: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkWorkerCalc()} placeholder="?" style={{ width: "100%", padding: "10px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                  </div>
-                ))}
-              </div>
-            </>}
-
-            {/* Phase 3: Continuous probability distribution (hard) */}
-            {workerCalcPhase === 3 && <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "12px", position: "relative" }}>
-                The daily output (<strong style={{ color: "#facc15" }}>x</strong> kg) of a randomly selected worker in your <strong style={{ color: "#eab308" }}>{jobResult.dominant}</strong> sector follows the probability density function:
-              </p>
-
-              <div style={{ textAlign: "center", padding: "14px", background: "#0a0f1a", borderRadius: "10px", border: "1px solid #ef444440", marginBottom: "10px", position: "relative" }}>
-                <div style={{ fontSize: "20px", fontWeight: 800, color: "#fca5a5", fontFamily: "monospace" }}>f(x) = kx({workerCalcCorrect.hard.N} − x)</div>
-                <div style={{ fontSize: "11px", color: "#94a3b8", marginTop: "6px", fontFamily: "monospace" }}>0 &lt; x &lt; {workerCalcCorrect.hard.N}</div>
-                <div style={{ fontSize: "11px", color: "#64748b", fontFamily: "monospace" }}>f(x) = 0 otherwise</div>
-                <div style={{ fontSize: "10px", color: "#fb923c", marginTop: "6px" }}>N = {workerCalcCorrect.hard.N} (workers in the {jobResult.dominant} sector)</div>
-              </div>
-
-              {workerHardStep === 1 && <>
-                <div style={{ background: "#1a2a4a40", borderRadius: "8px", padding: "12px", marginBottom: "16px" }}>
-                  <div style={{ fontSize: "12px", color: "#e2e8f0", lineHeight: 1.8 }}>
-                    <strong style={{ color: "#c084fc" }}>Step 1:</strong> For f(x) to be a valid probability density function, the total area under the curve must equal 1. Find the value of <strong style={{ color: "#facc15" }}>k</strong>.
-                  </div>
-                  <div style={{ fontSize: "10px", color: "#94a3b8", marginTop: "8px", lineHeight: 1.8 }}>
-                    Solve: ∫₀ᴺ kx(N − x) dx = 1
-                  </div>
-                </div>
-                <div style={{ marginTop: "8px", padding: "6px 8px", borderRadius: "6px", background: "#c084fc10", border: "1px solid #c084fc30", fontSize: "9px", color: "#c084fc", fontFamily: "monospace", lineHeight: 1.6, marginBottom: "14px" }}>
-                  💡 Expand: kx(N−x) = k(Nx − x²)<br/>
-                  Integrate: k[Nx²/2 − x³/3] from 0 to N<br/>
-                  Set = 1, solve for k
-                </div>
-                <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "16px" }}>
-                  <span style={{ fontSize: "13px", fontWeight: 700, color: "#facc15" }}>k =</span>
-                  <input value={workerHardAnswers.k} onChange={e => setWorkerHardAnswers(p => ({ ...p, k: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkWorkerCalc()} placeholder={`e.g. ${(6 / Math.pow(workerCalcCorrect.hard.N, 3)).toFixed(6).substring(0, 8)}...`} style={{ flex: 1, padding: "12px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                </div>
-              </>}
-
-              {workerHardStep === 2 && <>
-                <div style={{ background: "#4ade8010", borderRadius: "8px", padding: "8px 12px", marginBottom: "12px", border: "1px solid #4ade8030" }}>
-                  <span style={{ fontSize: "10px", color: "#4ade80", fontWeight: 700 }}>✓ k = 6/{workerCalcCorrect.hard.N}³ = {(workerCalcCorrect.hard.kVal).toFixed(6)}</span>
-                </div>
-                <div style={{ background: "#1a2a4a40", borderRadius: "8px", padding: "12px", marginBottom: "16px" }}>
-                  <div style={{ fontSize: "12px", color: "#e2e8f0", lineHeight: 1.8 }}>
-                    <strong style={{ color: "#c084fc" }}>Step 2:</strong> What <strong style={{ color: "#facc15" }}>percentage</strong> of workers produce less than <strong style={{ color: "#22d3ee" }}>{workerCalcCorrect.hard.N / 4}</strong> kg per day?
-                  </div>
-                  <div style={{ fontSize: "10px", color: "#94a3b8", marginTop: "8px", lineHeight: 1.8 }}>
-                    Find P(X &lt; N/4) = ∫₀^(N/4) f(x) dx
-                  </div>
-                  <div style={{ fontSize: "12px", color: "#fb923c", fontWeight: 700, marginTop: "8px" }}>
-                    Then: how many of your {workerCalcCorrect.hard.N} workers is that?
-                  </div>
-                </div>
-                <div style={{ marginTop: "8px", padding: "6px 8px", borderRadius: "6px", background: "#c084fc10", border: "1px solid #c084fc30", fontSize: "9px", color: "#c084fc", fontFamily: "monospace", lineHeight: 1.6, marginBottom: "14px" }}>
-                  💡 Integrate (6/N³)·x(N−x) from 0 to N/4<br/>
-                  = (6/N³)[Nx²/2 − x³/3] from 0 to N/4<br/>
-                  Then × 100 for percentage, × {workerCalcCorrect.hard.N} for count
-                </div>
-                <div style={{ display: "flex", gap: "12px", marginBottom: "16px" }}>
-                  <div style={{ flex: 1 }}>
-                    <label style={{ fontSize: "10px", fontWeight: 700, color: "#facc15", display: "block", marginBottom: "4px" }}>Percentage (%)</label>
-                    <input value={workerHardAnswers.percent} onChange={e => setWorkerHardAnswers(p => ({ ...p, percent: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkWorkerCalc()} placeholder="e.g. 15.6" style={{ width: "100%", padding: "10px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                  </div>
-                  <div style={{ flex: 1 }}>
-                    <label style={{ fontSize: "10px", fontWeight: 700, color: "#22d3ee", display: "block", marginBottom: "4px" }}>Number of workers</label>
-                    <input value={workerHardAnswers.count} onChange={e => setWorkerHardAnswers(p => ({ ...p, count: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkWorkerCalc()} placeholder={`out of ${workerCalcCorrect.hard.N}`} style={{ width: "100%", padding: "10px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                  </div>
-                </div>
-              </>}
-            </>}
-
-            {workerCalcFeedback && (<div style={{ padding: "10px 14px", borderRadius: "8px", marginBottom: "12px", fontSize: "12px", fontWeight: 600, position: "relative", background: workerCalcFeedback.type === "success" ? "#4ade8015" : "#ef444415", border: `1px solid ${workerCalcFeedback.type === "success" ? "#4ade8040" : "#ef444440"}`, color: workerCalcFeedback.type === "success" ? "#4ade80" : "#fca5a5" }}>{workerCalcFeedback.msg}</div>)}
-            {workerCalcAttempts > 0 && <div style={{ fontSize: "10px", color: "#ef4444", textAlign: "center", marginBottom: "8px", position: "relative" }}>Attempts: {workerCalcAttempts}</div>}
-
-            <button onClick={checkWorkerCalc} style={{ ...S.popupBtn, width: "100%", textAlign: "center", background: workerCalcPhase === 3 ? "linear-gradient(135deg, #ef4444, #dc2626)" : "linear-gradient(135deg, #eab308, #ca8a04)" }}>{workerCalcPhase === 1 ? "✓ Submit Workers" : workerCalcPhase === 2 ? "✓ Submit Production" : workerCalcPhase === 4 ? "✓ Submit Expressions" : workerCalcPhase === 5 ? "✓ Submit Venn" : workerHardStep === 1 ? "✓ Submit k" : "✓ Submit Answer"}</button>
-            <div style={{ textAlign: "center", marginTop: "8px", fontSize: "9px", color: "#475569", position: "relative" }}>⚠ Each wrong answer costs 10% of your treasury</div>
-          </div>
-        </div>
+        <WorkerCalc
+          drag={dragWorker}
+          difficulty={mathDifficulty}
+          phase={workerCalcPhase}
+          hardStep={workerHardStep}
+          jobResult={jobResult}
+          correct={workerCalcCorrect}
+          venn={vennWorkers}
+          phase1Answers={workerCalcAnswers}
+          setPhase1Answers={setWorkerCalcAnswers}
+          algAnswers={workerAlgAnswers}
+          setAlgAnswers={setWorkerAlgAnswers}
+          vennAnswers={workerVennAnswers}
+          setVennAnswers={setWorkerVennAnswers}
+          prodAnswers={workerProdAnswers}
+          setProdAnswers={setWorkerProdAnswers}
+          hardAnswers={workerHardAnswers}
+          setHardAnswers={setWorkerHardAnswers}
+          feedback={workerCalcFeedback}
+          attempts={workerCalcAttempts}
+          onSubmit={checkWorkerCalc}
+        />
       )}
 
       {/* Pipe Calculation Challenge */}
       {showPipeCalc && pendingPipe && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "520px", textAlign: "left" , ...dragPipe.style}}>
-            <div {...dragPipe.handleProps} style={{...S.dragHandle, ...dragPipe.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "16px", position: "relative" }}>
-              <div style={{ fontSize: "48px", marginBottom: "4px" }}>{PIPE_SPECS[pendingPipe.type]?.icon}</div>
-              <div style={{ ...S.popupBadge, background: "#22d3ee20", borderColor: "#22d3ee40", color: "#22d3ee" }}>PIPE CALCULATION</div>
-              <div style={{ display: "inline-block", padding: "2px 10px", borderRadius: "6px", marginTop: "6px", fontSize: "10px", fontWeight: 700, background: mathDifficulty === "easy" ? "#22c55e20" : mathDifficulty === "hard" ? "#ef444420" : "#f59e0b20", color: mathDifficulty === "easy" ? "#4ade80" : mathDifficulty === "hard" ? "#fca5a5" : "#fbbf24" }}>
-                {mathDifficulty === "easy" ? "🟢 Easy" : mathDifficulty === "hard" ? "🔴 Hard — Related Rates" : "🟡 Medium"}
-              </div>
-            </div>
-
-            <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-              {mathDifficulty === "hard"
-                ? <>Solve this <strong style={{ color: "#ef4444" }}>related rates</strong> problem to lay your {PIPE_SPECS[pendingPipe.type]?.label.toLowerCase()}.</>
-                : <>Calculate the water flow through your {PIPE_SPECS[pendingPipe.type]?.label.toLowerCase()}.</>}
-            </p>
-
-            {/* Given values - only shown for easy/medium */}
-            {mathDifficulty !== "hard" && <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "12px", marginBottom: "16px", border: "1px solid #1a2a4a", position: "relative" }}>
-              <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "1px", marginBottom: "8px" }}>Given values</div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px", fontSize: "12px" }}>
-                <div style={{ padding: "6px 8px", borderRadius: "6px", background: "#1a2a4a40" }}>
-                  <div style={{ fontSize: "9px", color: "#64748b" }}>Start point</div>
-                  <div style={{ fontWeight: 700, color: "#22d3ee", fontFamily: "monospace" }}>({pendingPipe.x1}, {pendingPipe.y1})</div>
-                </div>
-                <div style={{ padding: "6px 8px", borderRadius: "6px", background: "#1a2a4a40" }}>
-                  <div style={{ fontSize: "9px", color: "#64748b" }}>End point</div>
-                  <div style={{ fontWeight: 700, color: "#22d3ee", fontFamily: "monospace" }}>({pendingPipe.x2}, {pendingPipe.y2})</div>
-                </div>
-                <div style={{ padding: "6px 8px", borderRadius: "6px", background: "#1a2a4a40" }}>
-                  <div style={{ fontSize: "9px", color: "#64748b" }}>Pipe radius (r)</div>
-                  <div style={{ fontWeight: 700, color: "#facc15", fontFamily: "monospace" }}>{pendingPipe.radiusCm} cm = {pendingPipe.rMeters} m</div>
-                </div>
-                <div style={{ padding: "6px 8px", borderRadius: "6px", background: "#1a2a4a40" }}>
-                  <div style={{ fontSize: "9px", color: "#64748b" }}>Time (T)</div>
-                  <div style={{ fontWeight: 700, color: "#fb923c", fontFamily: "monospace" }}>{pendingPipe.timeSeconds} seconds</div>
-                </div>
-                <div style={{ padding: "6px 8px", borderRadius: "6px", background: "#1a2a4a40", gridColumn: "span 2" }}>
-                  <div style={{ fontSize: "9px", color: "#64748b" }}>Grid scale</div>
-                  <div style={{ fontWeight: 700, color: "#94a3b8", fontFamily: "monospace" }}>1 cell = {METERS_PER_CELL}m</div>
-                </div>
-              </div>
-            </div>}
-
-            {/* Step progress */}
-            <div style={{ display: "flex", gap: "4px", marginBottom: "16px", position: "relative" }}>
-              {(mathDifficulty === "hard" ? [{n:4,l:"Related Rates"}] : [{n:1,l:"Distance (h)"},{n:2,l:"Volume (V)"},{n:3,l:"Flow Rate (Q)"}]).map(s => (
-                <div key={s.n} style={{ flex: 1, padding: "6px", borderRadius: "6px", textAlign: "center", fontSize: "10px", fontWeight: 700,
-                  background: pipeCalcStep === s.n ? "#22d3ee20" : pipeCalcStep > s.n ? "#4ade8020" : "#1a2a4a",
-                  border: `1px solid ${pipeCalcStep === s.n ? "#22d3ee" : pipeCalcStep > s.n ? "#4ade80" : "#2a3a5e"}`,
-                  color: pipeCalcStep === s.n ? "#22d3ee" : pipeCalcStep > s.n ? "#4ade80" : "#475569",
-                }}>{pipeCalcStep > s.n ? "✓ " : ""}{s.l}</div>
-              ))}
-            </div>
-
-            {/* Current step input */}
-            <div style={{ marginBottom: "16px", position: "relative" }}>
-              {pipeCalcStep === 1 && <div>
-                <div style={{ fontSize: "11px", fontWeight: 700, color: "#22d3ee", marginBottom: "4px" }}>Step 1: Calculate the pipe length (h) in metres</div>
-                <div style={{ fontSize: "10px", color: "#94a3b8", marginBottom: "8px", fontFamily: "monospace" }}>h = √((x₂−x₁)² + (y₂−y₁)²) × {METERS_PER_CELL}</div>
-                <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                  <span style={{ fontSize: "12px", fontWeight: 700, color: "#22d3ee" }}>h =</span>
-                  <input value={pipeCalcAnswer.h} onChange={e => setPipeCalcAnswer(p => ({ ...p, h: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkPipeCalc()} placeholder="metres" style={{ flex: 1, padding: "10px 14px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "16px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                  <span style={{ fontSize: "12px", color: "#64748b" }}>m</span>
-                </div>
-              </div>}
-              {pipeCalcStep === 2 && <div>
-                <div style={{ fontSize: "11px", fontWeight: 700, color: "#facc15", marginBottom: "4px" }}>Step 2: Calculate the volume (V) of the cylindrical pipe</div>
-                <div style={{ fontSize: "10px", color: "#94a3b8", marginBottom: "4px", fontFamily: "monospace" }}>V = π × r² × h</div>
-                <div style={{ fontSize: "10px", color: "#64748b", marginBottom: "8px" }}>r = {pendingPipe.rMeters}m, h = {pendingPipe.lengthM.toFixed(1)}m</div>
-                <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                  <span style={{ fontSize: "12px", fontWeight: 700, color: "#facc15" }}>V =</span>
-                  <input value={pipeCalcAnswer.v} onChange={e => setPipeCalcAnswer(p => ({ ...p, v: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkPipeCalc()} placeholder="m³" style={{ flex: 1, padding: "10px 14px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "16px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                  <span style={{ fontSize: "12px", color: "#64748b" }}>m³</span>
-                </div>
-              </div>}
-              {pipeCalcStep === 3 && <div>
-                <div style={{ fontSize: "11px", fontWeight: 700, color: "#4ade80", marginBottom: "4px" }}>Step 3: Calculate the flow rate (Q)</div>
-                <div style={{ fontSize: "10px", color: "#94a3b8", marginBottom: "4px", fontFamily: "monospace" }}>Q = V ÷ T</div>
-                <div style={{ fontSize: "10px", color: "#64748b", marginBottom: "8px" }}>V = {pendingPipe.volumeM3.toFixed(2)} m³, T = {pendingPipe.timeSeconds}s</div>
-                <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                  <span style={{ fontSize: "12px", fontWeight: 700, color: "#4ade80" }}>Q =</span>
-                  <input value={pipeCalcAnswer.q} onChange={e => setPipeCalcAnswer(p => ({ ...p, q: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkPipeCalc()} placeholder="m³/s" style={{ flex: 1, padding: "10px 14px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "16px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                  <span style={{ fontSize: "12px", color: "#64748b" }}>m³/s</span>
-                </div>
-              </div>}
-              {pipeCalcStep === 4 && <div>
-                <div style={{ fontSize: "11px", fontWeight: 700, color: "#ef4444", marginBottom: "8px" }}>🔴 Hard: Related Rates</div>
-                <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "14px", marginBottom: "14px", border: "1px solid #ef444440" }}>
-                  <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, margin: 0 }}>
-                    Water flows at a rate of <strong style={{ color: "#22d3ee" }}>600 cm³/s</strong> through a cylindrical tank.
-                  </p>
-                  <p style={{ fontSize: "13px", color: "#fb923c", fontWeight: 700, lineHeight: 1.6, margin: "8px 0 0" }}>
-                    How fast is the height of the water level changing when the radius of the cylinder is <strong style={{ color: "#facc15" }}>50 cm</strong>?
-                  </p>
-                </div>
-                <div style={{ background: "#1a2a4a40", borderRadius: "8px", padding: "10px", marginBottom: "14px" }}>
-                  <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: "6px" }}>Given</div>
-                  <div style={{ display: "flex", gap: "12px", fontSize: "12px", fontFamily: "monospace" }}>
-                    <span style={{ color: "#22d3ee" }}>dV/dt = 600 cm³/s</span>
-                    <span style={{ color: "#facc15" }}>r = 50 cm</span>
-                  </div>
-                  <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginTop: "10px", marginBottom: "6px" }}>Find</div>
-                  <div style={{ fontSize: "12px", fontFamily: "monospace", color: "#fb923c" }}>dh/dt = ? cm/s</div>
-                </div>
-                <div style={{ fontSize: "9px", color: "#64748b", fontFamily: "monospace", marginBottom: "14px", lineHeight: 1.6, background: "#c084fc10", border: "1px solid #c084fc30", borderRadius: "6px", padding: "8px" }}>
-                  💡 V = πr²h<br/>
-                  Differentiate with respect to time:<br/>
-                  dV/dt = πr² × dh/dt<br/>
-                  Rearrange to find dh/dt
-                </div>
-                <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                  <span style={{ fontSize: "12px", fontWeight: 700, color: "#ef4444" }}>dh/dt =</span>
-                  <input value={pipeCalcAnswer.dhdt} onChange={e => setPipeCalcAnswer(p => ({ ...p, dhdt: e.target.value }))} onKeyDown={e => e.key === "Enter" && checkPipeCalc()} placeholder="e.g. 0.0764" style={{ flex: 1, padding: "10px 14px", borderRadius: "8px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "16px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-                  <span style={{ fontSize: "12px", color: "#64748b" }}>cm/s</span>
-                </div>
-              </div>}
-            </div>
-            {pipeCalcFeedback && (
-              <div style={{ padding: "10px 14px", borderRadius: "8px", marginBottom: "12px", fontSize: "12px", fontWeight: 600, position: "relative",
-                background: pipeCalcFeedback.type === "success" ? "#4ade8015" : "#ef444415",
-                border: `1px solid ${pipeCalcFeedback.type === "success" ? "#4ade8040" : "#ef444440"}`,
-                color: pipeCalcFeedback.type === "success" ? "#4ade80" : "#fca5a5",
-              }}>{pipeCalcFeedback.msg}</div>
-            )}
-
-            {pipeAttempts > 0 && <div style={{ fontSize: "10px", color: "#ef4444", textAlign: "center", marginBottom: "8px", position: "relative" }}>Attempts: {pipeAttempts}</div>}
-
-            <div style={{ display: "flex", gap: "8px", position: "relative" }}>
-              <button onClick={checkPipeCalc} style={{ ...S.popupBtn, flex: 1, textAlign: "center", background: pipeCalcStep === 4 ? "linear-gradient(135deg, #ef4444, #dc2626)" : "linear-gradient(135deg, #22d3ee, #0891b2)" }}>{pipeCalcStep === 4 ? "✓ Submit Answer" : `✓ Submit Step ${pipeCalcStep}`}</button>
-              <button onClick={() => { setShowPipeCalc(false); setPendingPipe(null); setPipeDragStart(null); }} style={{ padding: "10px 16px", borderRadius: "10px", background: "#1a2a4a", border: "1px solid #2a3a5e", color: "#94a3b8", cursor: "pointer", fontWeight: 600, fontSize: "12px", fontFamily: "inherit" }}>Cancel</button>
-            </div>
-
-            {!calcMode && <div style={{ textAlign: "center", marginTop: "10px", fontSize: "9px", color: "#f59e0b", position: "relative" }}>✏️ Calculator is OFF — show your working!</div>}
-            <div style={{ textAlign: "center", marginTop: "6px", fontSize: "9px", color: "#475569", position: "relative" }}>⚠ Each wrong answer costs 10% of your treasury</div>
-          </div>
-        </div>
+        <PipeCalc
+          drag={dragPipe}
+          pendingPipe={pendingPipe}
+          difficulty={mathDifficulty}
+          step={pipeCalcStep}
+          answer={pipeCalcAnswer}
+          setAnswer={setPipeCalcAnswer}
+          onSubmit={checkPipeCalc}
+          feedback={pipeCalcFeedback}
+          attempts={pipeAttempts}
+          calcMode={calcMode}
+          onCancel={() => { setShowPipeCalc(false); setPendingPipe(null); setPipeDragStart(null); }}
+        />
       )}
 
       {/* Energy Resilience Event — Bloom: Analysis (phase 1) + Evaluation (phase 2) */}
       {showEnergyEvent && energyEventData && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "500px", textAlign: "left", ...dragEnergyEvent.style }}>
-            <div {...dragEnergyEvent.handleProps} style={{...S.dragHandle, ...dragEnergyEvent.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "16px", position: "relative" }}>
-              <div style={{ fontSize: "48px", marginBottom: "4px" }}>{energyEventPhase === 1 ? "⚡" : "🧠"}</div>
-              <div style={{ ...S.popupBadge, background: "#ef444420", borderColor: "#ef444440", color: "#fca5a5" }}>
-                POWER FAULT · {energyEventPhase === 1 ? "ANALYSIS" : "EVALUATION"}
-              </div>
+        <HigherOrderEvent
+          drag={dragEnergyEvent}
+          accent={{ badgeBg: "#ef444420", badgeBorder: "#ef444440", badgeColor: "#fca5a5", scenarioBorder: "#ef444430", icon: "⚡" }}
+          label="POWER FAULT"
+          phase={energyEventPhase}
+          difficulty={mathDifficulty}
+          scenario={<>
+            <div style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6 }}>
+              A fault has knocked your <strong style={{ color: "#fca5a5" }}>{energyEventData.icon} {energyEventData.name}</strong> offline. It was supplying <strong style={{ color: "#facc15" }}>{energyEventData.P}</strong> units of power. Your <strong>{energyEventData.houseCount}</strong> house{energyEventData.houseCount === 1 ? "" : "s"} and <strong>{energyEventData.bizCount}</strong> business{energyEventData.bizCount === 1 ? "" : "es"} draw <strong style={{ color: "#22d3ee" }}>{energyEventData.U}</strong> units in total.
             </div>
-
-            {/* Scenario */}
-            <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "12px", marginBottom: "14px", border: "1px solid #ef444430", position: "relative" }}>
-              <div style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6 }}>
-                A fault has knocked your <strong style={{ color: "#fca5a5" }}>{energyEventData.icon} {energyEventData.name}</strong> offline. It was supplying <strong style={{ color: "#facc15" }}>{energyEventData.P}</strong> units of power. Your <strong>{energyEventData.houseCount}</strong> house{energyEventData.houseCount === 1 ? "" : "s"} and <strong>{energyEventData.bizCount}</strong> business{energyEventData.bizCount === 1 ? "" : "es"} draw <strong style={{ color: "#22d3ee" }}>{energyEventData.U}</strong> units in total.
-              </div>
-              <div style={{ display: "flex", gap: "10px", marginTop: "10px", fontSize: "11px", fontFamily: "monospace", flexWrap: "wrap" }}>
-                <span style={{ color: "#94a3b8" }}>Capacity C = <strong style={{ color: "#e2e8f0" }}>{energyEventData.C}</strong></span>
-                <span style={{ color: "#94a3b8" }}>Lost P = <strong style={{ color: "#fca5a5" }}>{energyEventData.P}</strong></span>
-                <span style={{ color: "#94a3b8" }}>Demand U = <strong style={{ color: "#22d3ee" }}>{energyEventData.U}</strong></span>
-              </div>
+            <div style={{ display: "flex", gap: "10px", marginTop: "10px", fontSize: "11px", fontFamily: "monospace", flexWrap: "wrap" }}>
+              <span style={{ color: "#94a3b8" }}>Capacity C = <strong style={{ color: "#e2e8f0" }}>{energyEventData.C}</strong></span>
+              <span style={{ color: "#94a3b8" }}>Lost P = <strong style={{ color: "#fca5a5" }}>{energyEventData.P}</strong></span>
+              <span style={{ color: "#94a3b8" }}>Demand U = <strong style={{ color: "#22d3ee" }}>{energyEventData.U}</strong></span>
             </div>
-
-            {energyEventPhase === 1 ? <>
-              {/* Difficulty badge */}
-              <div style={{ display: "inline-block", padding: "2px 10px", borderRadius: "6px", marginBottom: "10px", fontSize: "10px", fontWeight: 700, position: "relative", background: mathDifficulty === "easy" ? "#22c55e20" : mathDifficulty === "hard" ? "#ef444420" : "#f59e0b20", color: mathDifficulty === "easy" ? "#4ade80" : mathDifficulty === "hard" ? "#fca5a5" : "#fbbf24", border: `1px solid ${mathDifficulty === "easy" ? "#22c55e40" : mathDifficulty === "hard" ? "#ef444440" : "#f59e0b40"}` }}>
-                {mathDifficulty === "easy" ? "🟢 Easy" : mathDifficulty === "hard" ? "🔴 Hard" : "🟡 Medium"}
-              </div>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "12px", position: "relative" }}>
-                <strong style={{ color: "#facc15" }}>Analyse the effect.</strong>{" "}
-                {mathDifficulty === "easy" ? "What will your total power capacity be now this turbine is offline?"
-                  : mathDifficulty === "hard" ? "By what percentage does your generating capacity fall when this turbine goes offline? Give your answer to 1 decimal place."
-                  : "What is your new power balance (remaining capacity − demand) after the failure?"}
-              </p>
-              <input type="text" value={energyEventAnswer} onChange={e => setEnergyEventAnswer(e.target.value)} onKeyDown={e => e.key === "Enter" && energyEventAnswer && checkEnergyAnalysis()}
-                placeholder={mathDifficulty === "hard" ? "e.g. 21.1" : mathDifficulty === "medium" ? "e.g. -40 or 120" : "e.g. 320"}
-                style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none", marginBottom: "12px" }} />
-            </> : <>
-              {/* Evaluation */}
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "12px", position: "relative" }}>
-                <strong style={{ color: "#a5b4fc" }}>Evaluate.</strong> What could you have done to reduce the impact of losing a single turbine?
-              </p>
-              <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginBottom: "12px", position: "relative" }}>
-                {ENERGY_EVENT_OPTIONS.map(opt => {
-                  const sel = energyEventEvalChoice === opt.id;
-                  return (
-                    <button key={opt.id} onClick={() => { setEnergyEventEvalChoice(opt.id); setEnergyEventFeedback(null); }} style={{
-                      textAlign: "left", padding: "10px 12px", borderRadius: "10px", cursor: "pointer", fontFamily: "inherit", fontSize: "12px", lineHeight: 1.4,
-                      border: sel ? "2px solid #a5b4fc" : "2px solid #1a2a4a", background: sel ? "#a5b4fc15" : "#080f1e", color: sel ? "#e2e8f0" : "#94a3b8",
-                    }}>{opt.text}</button>
-                  );
-                })}
-              </div>
-            </>}
-
-            {/* Feedback */}
-            {energyEventFeedback && (
-              <div style={{ padding: "10px 14px", borderRadius: "8px", marginBottom: "12px", fontSize: "12px", fontWeight: 600, lineHeight: 1.4, position: "relative", background: energyEventFeedback.type === "success" ? "#4ade8015" : "#ef444415", border: `1px solid ${energyEventFeedback.type === "success" ? "#4ade8040" : "#ef444440"}`, color: energyEventFeedback.type === "success" ? "#4ade80" : "#fca5a5" }}>
-                {energyEventFeedback.msg}
-              </div>
-            )}
-
-            <div style={{ display: "flex", gap: "8px", position: "relative" }}>
-              {energyEventPhase === 1 ? (
-                <button onClick={checkEnergyAnalysis} disabled={!energyEventAnswer} style={{ ...S.popupBtn, flex: 1, textAlign: "center", opacity: energyEventAnswer ? 1 : 0.4, cursor: energyEventAnswer ? "pointer" : "not-allowed" }}>✓ Submit Analysis</button>
-              ) : (
-                <button onClick={submitEnergyEvaluation} disabled={energyEventEvalChoice == null} style={{ ...S.popupBtn, flex: 1, textAlign: "center", opacity: energyEventEvalChoice != null ? 1 : 0.4, cursor: energyEventEvalChoice != null ? "pointer" : "not-allowed" }}>✓ Submit Evaluation</button>
-              )}
-            </div>
-            <div style={{ textAlign: "center", marginTop: "8px", fontSize: "9px", color: "#475569", position: "relative" }}>
-              {energyEventPhase === 1 ? "Step 1 of 2 — analyse the fault, then evaluate your response" : "Step 2 of 2 — choose the best mitigation"}
-            </div>
-          </div>
-        </div>
+          </>}
+          question={<><strong style={{ color: "#facc15" }}>Analyse the effect.</strong>{" "}
+            {mathDifficulty === "easy" ? "What will your total power capacity be now this turbine is offline?"
+              : mathDifficulty === "hard" ? "By what percentage does your generating capacity fall when this turbine goes offline? Give your answer to 1 decimal place."
+                : "What is your new power balance (remaining capacity − demand) after the failure?"}</>}
+          placeholder={mathDifficulty === "hard" ? "e.g. 21.1" : mathDifficulty === "medium" ? "e.g. -40 or 120" : "e.g. 320"}
+          answer={energyEventAnswer}
+          setAnswer={setEnergyEventAnswer}
+          onCheckAnalysis={checkEnergyAnalysis}
+          evalPrompt="What could you have done to reduce the impact of losing a single turbine?"
+          options={ENERGY_EVENT_OPTIONS}
+          evalChoice={energyEventEvalChoice}
+          setEvalChoice={setEnergyEventEvalChoice}
+          onSubmitEvaluation={submitEnergyEvaluation}
+          feedback={energyEventFeedback}
+          setFeedback={setEnergyEventFeedback}
+          footerAnalysis="Step 1 of 2 — analyse the fault, then evaluate your response"
+          footerEvaluation="Step 2 of 2 — choose the best mitigation"
+        />
       )}
 
       {/* Housing / Workforce Event — Bloom: Analysis (phase 1) + Evaluation (phase 2) */}
       {showHousingEvent && housingEventData && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "500px", textAlign: "left", ...dragHousingEvent.style }}>
-            <div {...dragHousingEvent.handleProps} style={{...S.dragHandle, ...dragHousingEvent.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "16px", position: "relative" }}>
-              <div style={{ fontSize: "48px", marginBottom: "4px" }}>{housingEventPhase === 1 ? "🧑‍🏭" : "🧠"}</div>
-              <div style={{ ...S.popupBadge, background: "#a855f720", borderColor: "#a855f740", color: "#d8b4fe" }}>
-                WORKER SHORTAGE · {housingEventPhase === 1 ? "ANALYSIS" : "EVALUATION"}
-              </div>
+        <HigherOrderEvent
+          drag={dragHousingEvent}
+          accent={{ badgeBg: "#a855f720", badgeBorder: "#a855f740", badgeColor: "#d8b4fe", scenarioBorder: "#a855f730", icon: "🧑‍🏭" }}
+          label="WORKER SHORTAGE"
+          phase={housingEventPhase}
+          difficulty={mathDifficulty}
+          scenario={<>
+            <div style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6 }}>
+              Your businesses now need <strong style={{ color: "#facc15" }}>{housingEventData.W}</strong> workers in total, but your housing isn't supplying enough working-age adults. You have <strong style={{ color: "#60a5fa" }}>{housingEventData.houseCount}</strong> House{housingEventData.houseCount === 1 ? "" : "s"} and <strong style={{ color: "#818cf8" }}>{housingEventData.condoCount}</strong> Condo block{housingEventData.condoCount === 1 ? "" : "s"}.
             </div>
-
-            {/* Scenario */}
-            <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "12px", marginBottom: "14px", border: "1px solid #a855f730", position: "relative" }}>
-              <div style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6 }}>
-                Your businesses now need <strong style={{ color: "#facc15" }}>{housingEventData.W}</strong> workers in total, but your housing isn't supplying enough working-age adults. You have <strong style={{ color: "#60a5fa" }}>{housingEventData.houseCount}</strong> House{housingEventData.houseCount === 1 ? "" : "s"} and <strong style={{ color: "#818cf8" }}>{housingEventData.condoCount}</strong> Condo block{housingEventData.condoCount === 1 ? "" : "s"}.
-              </div>
-              <div style={{ display: "flex", gap: "10px", marginTop: "10px", fontSize: "11px", fontFamily: "monospace", flexWrap: "wrap" }}>
-                <span style={{ color: "#94a3b8" }}>Jobs W = <strong style={{ color: "#facc15" }}>{housingEventData.W}</strong></span>
-                {mathDifficulty === "easy" ? (
-                  <span style={{ color: "#94a3b8" }}>Adults A = <strong style={{ color: "#4ade80" }}>{housingEventData.A}</strong></span>
-                ) : <>
-                  <span style={{ color: "#94a3b8" }}>Founders = <strong style={{ color: "#e2e8f0" }}>{housingEventData.initialAdults}</strong></span>
-                  <span style={{ color: "#94a3b8" }}>House = <strong style={{ color: "#60a5fa" }}>{housingEventData.houseAdults}</strong> adults</span>
-                  <span style={{ color: "#94a3b8" }}>Condo = <strong style={{ color: "#818cf8" }}>{housingEventData.condoAdults}</strong> adults</span>
-                </>}
-              </div>
+            <div style={{ display: "flex", gap: "10px", marginTop: "10px", fontSize: "11px", fontFamily: "monospace", flexWrap: "wrap" }}>
+              <span style={{ color: "#94a3b8" }}>Jobs W = <strong style={{ color: "#facc15" }}>{housingEventData.W}</strong></span>
+              {mathDifficulty === "easy" ? (
+                <span style={{ color: "#94a3b8" }}>Adults A = <strong style={{ color: "#4ade80" }}>{housingEventData.A}</strong></span>
+              ) : <>
+                <span style={{ color: "#94a3b8" }}>Founders = <strong style={{ color: "#e2e8f0" }}>{housingEventData.initialAdults}</strong></span>
+                <span style={{ color: "#94a3b8" }}>House = <strong style={{ color: "#60a5fa" }}>{housingEventData.houseAdults}</strong> adults</span>
+                <span style={{ color: "#94a3b8" }}>Condo = <strong style={{ color: "#818cf8" }}>{housingEventData.condoAdults}</strong> adults</span>
+              </>}
             </div>
-
-            {housingEventPhase === 1 ? <>
-              <div style={{ display: "inline-block", padding: "2px 10px", borderRadius: "6px", marginBottom: "10px", fontSize: "10px", fontWeight: 700, position: "relative", background: mathDifficulty === "easy" ? "#22c55e20" : mathDifficulty === "hard" ? "#ef444420" : "#f59e0b20", color: mathDifficulty === "easy" ? "#4ade80" : mathDifficulty === "hard" ? "#fca5a5" : "#fbbf24", border: `1px solid ${mathDifficulty === "easy" ? "#22c55e40" : mathDifficulty === "hard" ? "#ef444440" : "#f59e0b40"}` }}>
-                {mathDifficulty === "easy" ? "🟢 Easy" : mathDifficulty === "hard" ? "🔴 Hard" : "🟡 Medium"}
-              </div>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "12px", position: "relative" }}>
-                <strong style={{ color: "#facc15" }}>Analyse the gap.</strong>{" "}
-                {mathDifficulty === "easy" ? "How many more workers do you need (jobs − adults)?"
-                  : mathDifficulty === "hard" ? "How many Condo blocks would you need to add to close the worker gap? (Each Condo adds the adults shown above; round up.)"
-                  : "Work out your total working-age adults from the housing ratio, then give the shortfall (jobs − adults)."}
-              </p>
-              <input type="text" value={housingEventAnswer} onChange={e => setHousingEventAnswer(e.target.value)} onKeyDown={e => e.key === "Enter" && housingEventAnswer && checkHousingAnalysis()}
-                placeholder={mathDifficulty === "hard" ? "e.g. 2" : "e.g. 12"}
-                style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none", marginBottom: "12px" }} />
-            </> : <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "12px", position: "relative" }}>
-                <strong style={{ color: "#a5b4fc" }}>Evaluate.</strong> Your city is short of workers. What could you have done to avoid this?
-              </p>
-              <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginBottom: "12px", position: "relative" }}>
-                {HOUSING_EVENT_OPTIONS.map(opt => {
-                  const sel = housingEventEvalChoice === opt.id;
-                  return (
-                    <button key={opt.id} onClick={() => { setHousingEventEvalChoice(opt.id); setHousingEventFeedback(null); }} style={{
-                      textAlign: "left", padding: "10px 12px", borderRadius: "10px", cursor: "pointer", fontFamily: "inherit", fontSize: "12px", lineHeight: 1.4,
-                      border: sel ? "2px solid #a5b4fc" : "2px solid #1a2a4a", background: sel ? "#a5b4fc15" : "#080f1e", color: sel ? "#e2e8f0" : "#94a3b8",
-                    }}>{opt.text}</button>
-                  );
-                })}
-              </div>
-            </>}
-
-            {housingEventFeedback && (
-              <div style={{ padding: "10px 14px", borderRadius: "8px", marginBottom: "12px", fontSize: "12px", fontWeight: 600, lineHeight: 1.4, position: "relative", background: housingEventFeedback.type === "success" ? "#4ade8015" : "#ef444415", border: `1px solid ${housingEventFeedback.type === "success" ? "#4ade8040" : "#ef444440"}`, color: housingEventFeedback.type === "success" ? "#4ade80" : "#fca5a5" }}>
-                {housingEventFeedback.msg}
-              </div>
-            )}
-
-            <div style={{ display: "flex", gap: "8px", position: "relative" }}>
-              {housingEventPhase === 1 ? (
-                <button onClick={checkHousingAnalysis} disabled={!housingEventAnswer} style={{ ...S.popupBtn, flex: 1, textAlign: "center", opacity: housingEventAnswer ? 1 : 0.4, cursor: housingEventAnswer ? "pointer" : "not-allowed" }}>✓ Submit Analysis</button>
-              ) : (
-                <button onClick={submitHousingEvaluation} disabled={housingEventEvalChoice == null} style={{ ...S.popupBtn, flex: 1, textAlign: "center", opacity: housingEventEvalChoice != null ? 1 : 0.4, cursor: housingEventEvalChoice != null ? "pointer" : "not-allowed" }}>✓ Submit Evaluation</button>
-              )}
-            </div>
-            <div style={{ textAlign: "center", marginTop: "8px", fontSize: "9px", color: "#475569", position: "relative" }}>
-              {housingEventPhase === 1 ? "Step 1 of 2 — analyse the shortage, then evaluate your response" : "Step 2 of 2 — choose the best fix"}
-            </div>
-          </div>
-        </div>
+          </>}
+          question={<><strong style={{ color: "#facc15" }}>Analyse the gap.</strong>{" "}
+            {mathDifficulty === "easy" ? "How many more workers do you need (jobs − adults)?"
+              : mathDifficulty === "hard" ? "How many Condo blocks would you need to add to close the worker gap? (Each Condo adds the adults shown above; round up.)"
+                : "Work out your total working-age adults from the housing ratio, then give the shortfall (jobs − adults)."}</>}
+          placeholder={mathDifficulty === "hard" ? "e.g. 2" : "e.g. 12"}
+          answer={housingEventAnswer}
+          setAnswer={setHousingEventAnswer}
+          onCheckAnalysis={checkHousingAnalysis}
+          evalPrompt="Your city is short of workers. What could you have done to avoid this?"
+          options={HOUSING_EVENT_OPTIONS}
+          evalChoice={housingEventEvalChoice}
+          setEvalChoice={setHousingEventEvalChoice}
+          onSubmitEvaluation={submitHousingEvaluation}
+          feedback={housingEventFeedback}
+          setFeedback={setHousingEventFeedback}
+          footerAnalysis="Step 1 of 2 — analyse the shortage, then evaluate your response"
+          footerEvaluation="Step 2 of 2 — choose the best fix"
+        />
       )}
 
       {/* Water Pipe r² Blockage Event — Analysis (1) + Evaluation (2) */}
       {showWaterEvent && waterEventData && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "500px", textAlign: "left", ...dragWaterEvent.style }}>
-            <div {...dragWaterEvent.handleProps} style={{...S.dragHandle, ...dragWaterEvent.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "16px", position: "relative" }}>
-              <div style={{ fontSize: "48px", marginBottom: "4px" }}>{waterEventPhase === 1 ? "💧" : "🧠"}</div>
-              <div style={{ ...S.popupBadge, background: "#22d3ee20", borderColor: "#22d3ee40", color: "#67e8f9" }}>
-                PIPE BLOCKAGE · {waterEventPhase === 1 ? "ANALYSIS" : "EVALUATION"}
-              </div>
+        <HigherOrderEvent
+          drag={dragWaterEvent}
+          accent={{ badgeBg: "#22d3ee20", badgeBorder: "#22d3ee40", badgeColor: "#67e8f9", scenarioBorder: "#22d3ee30", icon: "💧" }}
+          label="PIPE BLOCKAGE"
+          phase={waterEventPhase}
+          difficulty={mathDifficulty}
+          scenario={<>
+            <div style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6 }}>
+              Mineral build-up is restricting one of your {waterEventData.label}s, which has a radius of <strong style={{ color: "#67e8f9" }}>{waterEventData.r} cm</strong>. Remember: flow rate is proportional to <strong style={{ color: "#facc15" }}>r²</strong>.
             </div>
-            <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "12px", marginBottom: "14px", border: "1px solid #22d3ee30", position: "relative" }}>
-              <div style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6 }}>
-                Mineral build-up is restricting one of your {waterEventData.label}s, which has a radius of <strong style={{ color: "#67e8f9" }}>{waterEventData.r} cm</strong>. Remember: flow rate is proportional to <strong style={{ color: "#facc15" }}>r²</strong>.
-              </div>
-              <div style={{ display: "flex", gap: "10px", marginTop: "10px", fontSize: "11px", fontFamily: "monospace", flexWrap: "wrap" }}>
-                <span style={{ color: "#94a3b8" }}>Radius r = <strong style={{ color: "#67e8f9" }}>{waterEventData.r} cm</strong></span>
-                {mathDifficulty === "medium" && <span style={{ color: "#94a3b8" }}>Flow = <strong style={{ color: "#facc15" }}>{waterEventData.Qls} L/s</strong></span>}
-                {mathDifficulty === "hard" && <span style={{ color: "#94a3b8" }}>Now r = <strong style={{ color: "#fca5a5" }}>{waterEventData.hardRb} cm</strong></span>}
-                <span style={{ color: "#94a3b8" }}>Q ∝ <strong style={{ color: "#facc15" }}>r²</strong></span>
-              </div>
+            <div style={{ display: "flex", gap: "10px", marginTop: "10px", fontSize: "11px", fontFamily: "monospace", flexWrap: "wrap" }}>
+              <span style={{ color: "#94a3b8" }}>Radius r = <strong style={{ color: "#67e8f9" }}>{waterEventData.r} cm</strong></span>
+              {mathDifficulty === "medium" && <span style={{ color: "#94a3b8" }}>Flow = <strong style={{ color: "#facc15" }}>{waterEventData.Qls} L/s</strong></span>}
+              {mathDifficulty === "hard" && <span style={{ color: "#94a3b8" }}>Now r = <strong style={{ color: "#fca5a5" }}>{waterEventData.hardRb} cm</strong></span>}
+              <span style={{ color: "#94a3b8" }}>Q ∝ <strong style={{ color: "#facc15" }}>r²</strong></span>
             </div>
-            {waterEventPhase === 1 ? <>
-              <div style={{ display: "inline-block", padding: "2px 10px", borderRadius: "6px", marginBottom: "10px", fontSize: "10px", fontWeight: 700, position: "relative", background: mathDifficulty === "easy" ? "#22c55e20" : mathDifficulty === "hard" ? "#ef444420" : "#f59e0b20", color: mathDifficulty === "easy" ? "#4ade80" : mathDifficulty === "hard" ? "#fca5a5" : "#fbbf24", border: `1px solid ${mathDifficulty === "easy" ? "#22c55e40" : mathDifficulty === "hard" ? "#ef444440" : "#f59e0b40"}` }}>
-                {mathDifficulty === "easy" ? "🟢 Easy" : mathDifficulty === "hard" ? "🔴 Hard" : "🟡 Medium"}
-              </div>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "12px", position: "relative" }}>
-                <strong style={{ color: "#facc15" }}>Analyse the effect.</strong>{" "}
-                {mathDifficulty === "easy" ? "If the build-up halves the effective radius, the new flow is what fraction of the old? Give a decimal."
-                  : mathDifficulty === "hard" ? `The radius has fallen from ${waterEventData.r} cm to ${waterEventData.hardRb} cm. By what factor has the flow fallen (old ÷ new)? Give your answer to 2 decimal places.`
-                  : `The build-up reduces the radius to ${waterEventData.medPct}% of normal. The main carried ${waterEventData.Qls} L/s. What is the new flow rate, in L/s?`}
-              </p>
-              <input type="text" value={waterEventAnswer} onChange={e => setWaterEventAnswer(e.target.value)} onKeyDown={e => e.key === "Enter" && waterEventAnswer && checkWaterAnalysis()}
-                placeholder={mathDifficulty === "easy" ? "e.g. 0.25" : mathDifficulty === "hard" ? "e.g. 2.78" : "e.g. 58"}
-                style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none", marginBottom: "12px" }} />
-            </> : <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "12px", position: "relative" }}>
-                <strong style={{ color: "#a5b4fc" }}>Evaluate.</strong> What could you have done so a blockage like this didn't cut off supply?
-              </p>
-              <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginBottom: "12px", position: "relative" }}>
-                {WATER_EVENT_OPTIONS.map(opt => { const sel = waterEventEvalChoice === opt.id; return (
-                  <button key={opt.id} onClick={() => { setWaterEventEvalChoice(opt.id); setWaterEventFeedback(null); }} style={{ textAlign: "left", padding: "10px 12px", borderRadius: "10px", cursor: "pointer", fontFamily: "inherit", fontSize: "12px", lineHeight: 1.4, border: sel ? "2px solid #a5b4fc" : "2px solid #1a2a4a", background: sel ? "#a5b4fc15" : "#080f1e", color: sel ? "#e2e8f0" : "#94a3b8" }}>{opt.text}</button>
-                ); })}
-              </div>
-            </>}
-            {waterEventFeedback && (
-              <div style={{ padding: "10px 14px", borderRadius: "8px", marginBottom: "12px", fontSize: "12px", fontWeight: 600, lineHeight: 1.4, position: "relative", background: waterEventFeedback.type === "success" ? "#4ade8015" : "#ef444415", border: `1px solid ${waterEventFeedback.type === "success" ? "#4ade8040" : "#ef444440"}`, color: waterEventFeedback.type === "success" ? "#4ade80" : "#fca5a5" }}>{waterEventFeedback.msg}</div>
-            )}
-            <div style={{ display: "flex", gap: "8px", position: "relative" }}>
-              {waterEventPhase === 1 ? (
-                <button onClick={checkWaterAnalysis} disabled={!waterEventAnswer} style={{ ...S.popupBtn, flex: 1, textAlign: "center", opacity: waterEventAnswer ? 1 : 0.4, cursor: waterEventAnswer ? "pointer" : "not-allowed" }}>✓ Submit Analysis</button>
-              ) : (
-                <button onClick={submitWaterEvaluation} disabled={waterEventEvalChoice == null} style={{ ...S.popupBtn, flex: 1, textAlign: "center", opacity: waterEventEvalChoice != null ? 1 : 0.4, cursor: waterEventEvalChoice != null ? "pointer" : "not-allowed" }}>✓ Submit Evaluation</button>
-              )}
-            </div>
-            <div style={{ textAlign: "center", marginTop: "8px", fontSize: "9px", color: "#475569", position: "relative" }}>{waterEventPhase === 1 ? "Step 1 of 2 — analyse the blockage, then evaluate your response" : "Step 2 of 2 — choose the best fix"}</div>
-          </div>
-        </div>
+          </>}
+          question={<><strong style={{ color: "#facc15" }}>Analyse the effect.</strong>{" "}
+            {mathDifficulty === "easy" ? "If the build-up halves the effective radius, the new flow is what fraction of the old? Give a decimal."
+              : mathDifficulty === "hard" ? `The radius has fallen from ${waterEventData.r} cm to ${waterEventData.hardRb} cm. By what factor has the flow fallen (old ÷ new)? Give your answer to 2 decimal places.`
+                : `The build-up reduces the radius to ${waterEventData.medPct}% of normal. The main carried ${waterEventData.Qls} L/s. What is the new flow rate, in L/s?`}</>}
+          placeholder={mathDifficulty === "easy" ? "e.g. 0.25" : mathDifficulty === "hard" ? "e.g. 2.78" : "e.g. 58"}
+          answer={waterEventAnswer}
+          setAnswer={setWaterEventAnswer}
+          onCheckAnalysis={checkWaterAnalysis}
+          evalPrompt="What could you have done so a blockage like this didn't cut off supply?"
+          options={WATER_EVENT_OPTIONS}
+          evalChoice={waterEventEvalChoice}
+          setEvalChoice={setWaterEventEvalChoice}
+          onSubmitEvaluation={submitWaterEvaluation}
+          feedback={waterEventFeedback}
+          setFeedback={setWaterEventFeedback}
+          footerAnalysis="Step 1 of 2 — analyse the blockage, then evaluate your response"
+          footerEvaluation="Step 2 of 2 — choose the best fix"
+        />
       )}
 
       {/* Road Parallel-Isolation Event — Analysis (1) + Evaluation (2) */}
       {showRoadEvent && roadEventData && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "500px", textAlign: "left", ...dragRoadEvent.style }}>
-            <div {...dragRoadEvent.handleProps} style={{...S.dragHandle, ...dragRoadEvent.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "16px", position: "relative" }}>
-              <div style={{ fontSize: "48px", marginBottom: "4px" }}>{roadEventPhase === 1 ? "🛣️" : "🧠"}</div>
-              <div style={{ ...S.popupBadge, background: "#f59e0b20", borderColor: "#f59e0b40", color: "#fbbf24" }}>
-                DISTRICT CUT OFF · {roadEventPhase === 1 ? "ANALYSIS" : "EVALUATION"}
-              </div>
+        <HigherOrderEvent
+          drag={dragRoadEvent}
+          accent={{ badgeBg: "#f59e0b20", badgeBorder: "#f59e0b40", badgeColor: "#fbbf24", scenarioBorder: "#f59e0b30", icon: "🛣️" }}
+          label="DISTRICT CUT OFF"
+          phase={roadEventPhase}
+          difficulty={mathDifficulty}
+          scenario={<>
+            <div style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6 }}>
+              A landslide blocked the main route, isolating the north district. Road A (to the centre) is <strong style={{ color: "#fbbf24", fontFamily: "monospace" }}>y = {roadEventData.m}x {roadEventData.c1 < 0 ? "− " + Math.abs(roadEventData.c1) : "+ " + roadEventData.c1}</strong>. Your first link road came out as <strong style={{ color: "#fca5a5", fontFamily: "monospace" }}>y = {roadEventData.m}x {roadEventData.c2 < 0 ? "− " + Math.abs(roadEventData.c2) : "+ " + roadEventData.c2}</strong> — the same gradient.
             </div>
-            <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "12px", marginBottom: "14px", border: "1px solid #f59e0b30", position: "relative" }}>
-              <div style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6 }}>
-                A landslide blocked the main route, isolating the north district. Road A (to the centre) is <strong style={{ color: "#fbbf24", fontFamily: "monospace" }}>y = {roadEventData.m}x {roadEventData.c1 < 0 ? "− " + Math.abs(roadEventData.c1) : "+ " + roadEventData.c1}</strong>. Your first link road came out as <strong style={{ color: "#fca5a5", fontFamily: "monospace" }}>y = {roadEventData.m}x {roadEventData.c2 < 0 ? "− " + Math.abs(roadEventData.c2) : "+ " + roadEventData.c2}</strong> — the same gradient.
+            {mathDifficulty !== "easy" && (
+              <div style={{ marginTop: "10px", fontSize: "11px", fontFamily: "monospace", color: "#94a3b8" }}>
+                Re-survey points: <strong style={{ color: "#e2e8f0" }}>({roadEventData.x1}, {roadEventData.y1})</strong> and <strong style={{ color: "#e2e8f0" }}>({roadEventData.x2}, {roadEventData.y2})</strong>
               </div>
-              {mathDifficulty !== "easy" && (
-                <div style={{ marginTop: "10px", fontSize: "11px", fontFamily: "monospace", color: "#94a3b8" }}>
-                  Re-survey points: <strong style={{ color: "#e2e8f0" }}>({roadEventData.x1}, {roadEventData.y1})</strong> and <strong style={{ color: "#e2e8f0" }}>({roadEventData.x2}, {roadEventData.y2})</strong>
-                </div>
-              )}
-            </div>
-            {roadEventPhase === 1 ? <>
-              <div style={{ display: "inline-block", padding: "2px 10px", borderRadius: "6px", marginBottom: "10px", fontSize: "10px", fontWeight: 700, position: "relative", background: mathDifficulty === "easy" ? "#22c55e20" : mathDifficulty === "hard" ? "#ef444420" : "#f59e0b20", color: mathDifficulty === "easy" ? "#4ade80" : mathDifficulty === "hard" ? "#fca5a5" : "#fbbf24", border: `1px solid ${mathDifficulty === "easy" ? "#22c55e40" : mathDifficulty === "hard" ? "#ef444440" : "#f59e0b40"}` }}>
-                {mathDifficulty === "easy" ? "🟢 Easy" : mathDifficulty === "hard" ? "🔴 Hard" : "🟡 Medium"}
-              </div>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "12px", position: "relative" }}>
-                <strong style={{ color: "#facc15" }}>Analyse the layout.</strong>{" "}
-                {mathDifficulty === "easy" ? `Because both roads have gradient ${roadEventData.m}, at how many points do they cross?`
-                  : mathDifficulty === "hard" ? "Using the re-survey points, find the x-coordinate where the new link road meets Road A. Give your answer to 1 decimal place."
-                  : "You re-survey the link road to run through the two points above. What is its gradient?"}
-              </p>
-              <input type="text" value={roadEventAnswer} onChange={e => setRoadEventAnswer(e.target.value)} onKeyDown={e => e.key === "Enter" && roadEventAnswer && checkRoadAnalysis()}
-                placeholder={mathDifficulty === "easy" ? "e.g. 0" : mathDifficulty === "hard" ? "e.g. 3.5" : "e.g. 2"}
-                style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none", marginBottom: "12px" }} />
-            </> : <>
-              <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "12px", position: "relative" }}>
-                <strong style={{ color: "#a5b4fc" }}>Evaluate.</strong> What could you have done so the district wasn't cut off in the first place?
-              </p>
-              <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginBottom: "12px", position: "relative" }}>
-                {ROAD_EVENT_OPTIONS.map(opt => { const sel = roadEventEvalChoice === opt.id; return (
-                  <button key={opt.id} onClick={() => { setRoadEventEvalChoice(opt.id); setRoadEventFeedback(null); }} style={{ textAlign: "left", padding: "10px 12px", borderRadius: "10px", cursor: "pointer", fontFamily: "inherit", fontSize: "12px", lineHeight: 1.4, border: sel ? "2px solid #a5b4fc" : "2px solid #1a2a4a", background: sel ? "#a5b4fc15" : "#080f1e", color: sel ? "#e2e8f0" : "#94a3b8" }}>{opt.text}</button>
-                ); })}
-              </div>
-            </>}
-            {roadEventFeedback && (
-              <div style={{ padding: "10px 14px", borderRadius: "8px", marginBottom: "12px", fontSize: "12px", fontWeight: 600, lineHeight: 1.4, position: "relative", background: roadEventFeedback.type === "success" ? "#4ade8015" : "#ef444415", border: `1px solid ${roadEventFeedback.type === "success" ? "#4ade8040" : "#ef444440"}`, color: roadEventFeedback.type === "success" ? "#4ade80" : "#fca5a5" }}>{roadEventFeedback.msg}</div>
             )}
-            <div style={{ display: "flex", gap: "8px", position: "relative" }}>
-              {roadEventPhase === 1 ? (
-                <button onClick={checkRoadAnalysis} disabled={!roadEventAnswer} style={{ ...S.popupBtn, flex: 1, textAlign: "center", opacity: roadEventAnswer ? 1 : 0.4, cursor: roadEventAnswer ? "pointer" : "not-allowed" }}>✓ Submit Analysis</button>
-              ) : (
-                <button onClick={submitRoadEvaluation} disabled={roadEventEvalChoice == null} style={{ ...S.popupBtn, flex: 1, textAlign: "center", opacity: roadEventEvalChoice != null ? 1 : 0.4, cursor: roadEventEvalChoice != null ? "pointer" : "not-allowed" }}>✓ Submit Evaluation</button>
-              )}
-            </div>
-            <div style={{ textAlign: "center", marginTop: "8px", fontSize: "9px", color: "#475569", position: "relative" }}>{roadEventPhase === 1 ? "Step 1 of 2 — analyse the layout, then evaluate your response" : "Step 2 of 2 — choose the best fix"}</div>
-          </div>
-        </div>
+          </>}
+          question={<><strong style={{ color: "#facc15" }}>Analyse the layout.</strong>{" "}
+            {mathDifficulty === "easy" ? `Because both roads have gradient ${roadEventData.m}, at how many points do they cross?`
+              : mathDifficulty === "hard" ? "Using the re-survey points, find the x-coordinate where the new link road meets Road A. Give your answer to 1 decimal place."
+                : "You re-survey the link road to run through the two points above. What is its gradient?"}</>}
+          placeholder={mathDifficulty === "easy" ? "e.g. 0" : mathDifficulty === "hard" ? "e.g. 3.5" : "e.g. 2"}
+          answer={roadEventAnswer}
+          setAnswer={setRoadEventAnswer}
+          onCheckAnalysis={checkRoadAnalysis}
+          evalPrompt="What could you have done so the district wasn't cut off in the first place?"
+          options={ROAD_EVENT_OPTIONS}
+          evalChoice={roadEventEvalChoice}
+          setEvalChoice={setRoadEventEvalChoice}
+          onSubmitEvaluation={submitRoadEvaluation}
+          feedback={roadEventFeedback}
+          setFeedback={setRoadEventFeedback}
+          footerAnalysis="Step 1 of 2 — analyse the layout, then evaluate your response"
+          footerEvaluation="Step 2 of 2 — choose the best fix"
+        />
       )}
 
       {/* End of Week 1 — demo wrap-up report */}
       {showWeekEnd && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "540px", textAlign: "left", ...dragWeekEnd.style }}>
-            <div {...dragWeekEnd.handleProps} style={{...S.dragHandle, ...dragWeekEnd.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "14px", position: "relative" }}>
-              <div style={{ fontSize: "52px", marginBottom: "4px" }}>🗓️</div>
-              <div style={{ ...S.popupBadge, background: "#4ade8020", borderColor: "#4ade8040", color: "#86efac" }}>END OF WEEK 1</div>
-              <h2 style={{ fontSize: "22px", fontWeight: 800, color: "#fff", margin: "8px 0 4px", position: "relative" }}>Week 1 Complete!</h2>
-              <p style={{ fontSize: "12px", color: "#94a3b8", lineHeight: 1.5, position: "relative" }}>
-                You've finished all of Week 1's challenges. City status:{" "}
-                <strong style={{ color: happiness >= 75 ? "#4ade80" : happiness >= 50 ? "#fbbf24" : "#fca5a5" }}>
-                  {happiness >= 75 ? "Thriving" : happiness >= 50 ? "Stable" : "Struggling"}
-                </strong>
-              </p>
-            </div>
-
-            {/* Stats grid */}
-            <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginBottom: "14px", position: "relative" }}>
-              {[
-                { icon: "💰", label: "Treasury", value: `§${coins.toLocaleString()}` },
-                { icon: "👥", label: "Population", value: `${totalPop}`, sub: `${demographics.adults}A · ${demographics.children}C · ${demographics.elderly}E` },
-                { icon: "😊", label: "Satisfaction", value: `${Math.round(happiness)}%` },
-                { icon: "🔬", label: "Research", value: `${research} RP` },
-                { icon: "⚡", label: "Power balance", value: `${energyBalance >= 0 ? "+" : ""}${energyBalance}`, sub: `${powerCap} cap · ${energyConsumption} demand` },
-                { icon: "🌍", label: "CO₂ output", value: `${Object.values(placed).reduce((s, b) => s + (GENERATORS[b.type]?.co2 || 0), 0)}` },
-                { icon: "🏙️", label: "City level", value: `${cityLevel}` },
-                { icon: "🏗️", label: "Buildings", value: `${energyCount + Object.values(placed).filter(p => HOUSING_TYPES[p.type]).length + Object.values(placed).filter(p => GOODS_BUILDINGS[p.type]).length}`, sub: `${energyCount} gen · ${Object.values(placed).filter(p => HOUSING_TYPES[p.type]).length} homes · ${Object.values(placed).filter(p => GOODS_BUILDINGS[p.type]).length} biz` },
-                { icon: "🚰", label: "Infrastructure", value: `${placedPipes.length + placedRoads.length}`, sub: `${placedPipes.length} pipes · ${placedRoads.length} roads` },
-              ].map((s, i) => (
-                <div key={i} style={{ flex: "1 1 30%", minWidth: "140px", background: "#0a0f1a", border: "1px solid #1a2a4a", borderRadius: "10px", padding: "10px 12px" }}>
-                  <div style={{ fontSize: "10px", color: "#64748b", fontWeight: 600 }}>{s.icon} {s.label}</div>
-                  <div style={{ fontSize: "16px", color: "#e2e8f0", fontWeight: 800, marginTop: "2px" }}>{s.value}</div>
-                  {s.sub && <div style={{ fontSize: "9px", color: "#475569", marginTop: "1px", fontFamily: "monospace" }}>{s.sub}</div>}
-                </div>
-              ))}
-            </div>
-
-            <div style={{ background: "#a855f715", border: "1px solid #a855f740", borderRadius: "10px", padding: "10px 12px", marginBottom: "10px", position: "relative" }}>
-              <div style={{ fontSize: "12px", color: "#d8b4fe", lineHeight: 1.5, fontWeight: 700 }}>🧠 Higher-order challenges (analysis &amp; evaluation)</div>
-              <div style={{ fontSize: "11px", color: "#94a3b8", lineHeight: 1.5, marginTop: "2px" }}>
-                {heoStats.faced === 0 ? "None came up this week — keep playing to face power, water, road and workforce dilemmas." : `Solved ${heoStats.solved} of ${heoStats.faced} — ${heoStats.perfect} on the first try${heoStats.faced - heoStats.perfect > 0 ? `, ${heoStats.faced - heoStats.perfect} needed another go` : ""}.`}
-              </div>
-            </div>
-            <div style={{ background: "#1882c815", border: "1px solid #1882c840", borderRadius: "10px", padding: "10px 12px", marginBottom: "14px", position: "relative" }}>
-              <div style={{ fontSize: "12px", color: "#7dd3fc", lineHeight: 1.5, fontWeight: 600 }}>📦 This is the end of the demo.</div>
-              <div style={{ fontSize: "11px", color: "#94a3b8", lineHeight: 1.5, marginTop: "2px" }}>In the full game, Week 2 unlocks new districts, a fresh budget, and tougher engineering and maths challenges.</div>
-            </div>
-
-            <button onClick={() => setShowWeekEnd(false)} style={{ ...S.popupBtn, width: "100%", textAlign: "center", position: "relative" }}>🏗️ Keep building (sandbox) →</button>
-          </div>
-        </div>
+        <WeekEndReport
+          drag={dragWeekEnd}
+          onClose={() => setShowWeekEnd(false)}
+          happiness={happiness}
+          coins={coins}
+          totalPop={totalPop}
+          demographics={demographics}
+          research={research}
+          energyBalance={energyBalance}
+          powerCap={powerCap}
+          energyConsumption={energyConsumption}
+          placed={placed}
+          cityLevel={cityLevel}
+          energyCount={energyCount}
+          placedPipes={placedPipes}
+          placedRoads={placedRoads}
+          heoStats={heoStats}
+        />
       )}
 
       {/* Loci sketching intro */}
       {showLociIntro && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "480px", textAlign: "left" }}>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "14px", position: "relative" }}>
-              <div style={{ fontSize: "48px", marginBottom: "4px" }}>🧭</div>
-              <div style={{ ...S.popupBadge, background: "#f59e0b20", borderColor: "#f59e0b40", color: "#fbbf24" }}>LOCI · CONSTRUCTION</div>
-            </div>
-            <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "10px", position: "relative" }}>
-              A wind turbine powers everything within <strong style={{ color: "#facc15" }}>{WIND_RADIUS_M} m</strong>. The set of all points exactly {WIND_RADIUS_M} m from it forms a <strong style={{ color: "#a5b4fc" }}>locus</strong> — a circle of radius {WIND_RADIUS_M} m around the turbine.
-            </p>
-            <p style={{ fontSize: "12px", color: "#94a3b8", lineHeight: 1.6, marginBottom: "14px", position: "relative" }}>
-              Sketch that locus for the two highlighted turbines: click a turbine, then click a point on the edge of its range. The live readout shows your radius — aim for {WIND_RADIUS_M} m. Buildings placed inside the circle count as powered.
-            </p>
-            <button onClick={() => {
-              const turbines = Object.entries(placed).filter(([, v]) => v.type === "wind").map(([k]) => { const [tx, ty] = k.split(",").map(Number); return { x: tx, y: ty }; });
-              setLociTargets(turbines.slice(0, 2));
-              setLociDone([]); setLociCenter(null);
-              setLociFeedback({ type: "info", msg: "Click a highlighted turbine to begin." });
-              setShowLociIntro(false); setLociMode(true);
-            }} style={{ ...S.popupBtn, width: "100%", textAlign: "center", position: "relative" }}>✏️ Start sketching</button>
-          </div>
-        </div>
+        <LociIntro
+          windRadiusM={WIND_RADIUS_M}
+          onStart={() => {
+            const turbines = Object.entries(placed).filter(([, v]) => v.type === "wind").map(([k]) => { const [tx, ty] = k.split(",").map(Number); return { x: tx, y: ty }; });
+            setLociTargets(turbines.slice(0, 2));
+            setLociDone([]); setLociCenter(null);
+            setLociFeedback({ type: "info", msg: "Click a highlighted turbine to begin." });
+            setShowLociIntro(false); setLociMode(true);
+          }}
+        />
       )}
 
       {/* Loci sketching status banner */}
@@ -4585,90 +3350,25 @@ export default function STEMCityTerrain({ config, muted, onToggleMute }) {
 
       {/* Calculation Challenge */}
       {showCalcChallenge && !calcPassed && (
-        <div style={S.popupOverlay}>
-          <div style={{ ...S.popup, maxWidth: "500px", textAlign: "left" , ...dragCalc.style }}>
-            <div {...dragCalc.handleProps} style={{...S.dragHandle, ...dragCalc.handleProps.style}}><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/><span style={S.dragDots}/></div>
-            <div style={S.popupGlow} />
-            <div style={{ textAlign: "center", marginBottom: "16px", position: "relative" }}>
-              <div style={{ fontSize: "48px", marginBottom: "4px" }}>🧮</div>
-              <div style={{ ...S.popupBadge, background: "#3b82f620", borderColor: "#3b82f640", color: "#60a5fa" }}>CALCULATION CHALLENGE</div>
-            </div>
-
-            <p style={{ fontSize: "13px", color: "#e2e8f0", lineHeight: 1.6, marginBottom: "16px", position: "relative" }}>
-              {calcPhase === 1 ? <>You've placed {energyCount} energy generators. Now calculate the <strong style={{ color: "#facc15" }}>total energy output</strong> and <strong style={{ color: "#4ade80" }}>total cost</strong> of all your generators.{mathDifficulty === "hard" && <span style={{ color: "#ef4444" }}> Express your answers in standard form.</span>}{mathDifficulty === "medium" && <span style={{ color: "#f59e0b" }}> You'll then need to convert to kW.</span>}</> : <>Now convert <strong style={{ color: "#22d3ee" }}>{generatorTotals.totalMW} MW</strong> into <strong style={{ color: "#facc15" }}>kilowatts (kW)</strong>.</>}
-            </p>
-
-            {/* Difficulty badge */}
-            <div style={{ display: "inline-block", padding: "2px 10px", borderRadius: "6px", marginBottom: "12px", fontSize: "10px", fontWeight: 700, position: "relative", background: mathDifficulty === "easy" ? "#22c55e20" : mathDifficulty === "hard" ? "#ef444420" : "#f59e0b20", color: mathDifficulty === "easy" ? "#4ade80" : mathDifficulty === "hard" ? "#fca5a5" : "#fbbf24", border: `1px solid ${mathDifficulty === "easy" ? "#22c55e40" : mathDifficulty === "hard" ? "#ef444440" : "#f59e0b40"}` }}>
-              {mathDifficulty === "easy" ? "🟢 Easy" : mathDifficulty === "hard" ? "🔴 Hard — Standard Form" : "🟡 Medium — with kW conversion"}
-            </div>
-
-            {calcPhase === 1 && <>
-            {/* Generator breakdown */}
-            <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "12px", marginBottom: "16px", border: "1px solid #1a2a4a", position: "relative" }}>
-              <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "1px", marginBottom: "8px" }}>Your generators</div>
-              <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                {generatorTotals.breakdown.map((g, i) => (
-                  <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px 8px", borderRadius: "6px", background: "#1a2a4a40", fontSize: "12px" }}>
-                    <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{g.name}</span>
-                    <div style={{ display: "flex", gap: "12px" }}>
-                      <span style={{ color: "#22d3ee", fontFamily: "monospace", fontWeight: 700 }}>{mathDifficulty === "hard" ? toStdForm(g.power) : g.power} MW</span>
-                      <span style={{ color: "#fbbf24", fontFamily: "monospace", fontWeight: 700 }}>§{mathDifficulty === "hard" ? toStdForm(g.cost) : g.cost.toLocaleString()}</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              {mathDifficulty === "hard" && <div style={{ marginTop: "8px", padding: "6px 8px", borderRadius: "6px", background: "#ef444415", border: "1px solid #ef444430", fontSize: "9px", color: "#fca5a5" }}>🔴 Values shown in standard form. Answer in standard form (e.g. 9.6 × 10^2)</div>}
-              {!calcMode && <div style={{ marginTop: "8px", padding: "6px 8px", borderRadius: "6px", background: "#f59e0b15", border: "1px solid #f59e0b30", fontSize: "9px", color: "#f59e0b" }}>✏️ Calculator is OFF — work it out yourself!</div>}
-            </div>
-
-            {/* Input fields - Phase 1 */}
-            <div style={{ display: "flex", flexDirection: "column", gap: "12px", marginBottom: "16px", position: "relative" }}>
-              <div>
-                <label style={{ fontSize: "11px", fontWeight: 700, color: "#22d3ee", display: "block", marginBottom: "4px" }}>⚡ Total Energy Output (MW){mathDifficulty === "hard" && " — in standard form"}</label>
-                <input type="text" value={calcAnswerEnergy} onChange={e => setCalcAnswerEnergy(e.target.value)} onKeyDown={e => e.key === "Enter" && calcAnswerCost && checkCalcChallenge()} placeholder={mathDifficulty === "hard" ? "e.g. 9.6 × 10^2" : "e.g. 960"} style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-              </div>
-              <div>
-                <label style={{ fontSize: "11px", fontWeight: 700, color: "#fbbf24", display: "block", marginBottom: "4px" }}>💰 Total Cost (§){mathDifficulty === "hard" && " — in standard form"}</label>
-                <input type="text" value={calcAnswerCost} onChange={e => setCalcAnswerCost(e.target.value)} onKeyDown={e => e.key === "Enter" && calcAnswerEnergy && checkCalcChallenge()} placeholder={mathDifficulty === "hard" ? "e.g. 2.35 × 10^6" : "e.g. 2350000"} style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-              </div>
-            </div>
-            </>}
-
-            {/* Phase 2 - KW conversion (medium only) */}
-            {calcPhase === 2 && <div style={{ marginBottom: "16px", position: "relative" }}>
-              <div style={{ background: "#0a0f1a", borderRadius: "10px", padding: "12px", marginBottom: "16px", border: "1px solid #1a2a4a" }}>
-                <div style={{ fontSize: "10px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "1px", marginBottom: "6px" }}>Conversion</div>
-                <div style={{ fontSize: "12px", color: "#94a3b8", fontFamily: "monospace" }}>1 MW = 1,000 kW</div>
-                <div style={{ fontSize: "14px", color: "#22d3ee", fontFamily: "monospace", fontWeight: 700, marginTop: "6px" }}>Your total: {generatorTotals.totalMW} MW = ? kW</div>
-              </div>
-              <div>
-                <label style={{ fontSize: "11px", fontWeight: 700, color: "#facc15", display: "block", marginBottom: "4px" }}>⚡ Total Energy in Kilowatts (kW)</label>
-                <input type="text" value={calcAnswerKW} onChange={e => setCalcAnswerKW(e.target.value)} onKeyDown={e => e.key === "Enter" && checkCalcChallenge()} placeholder="e.g. 960000" style={{ width: "100%", padding: "12px 16px", borderRadius: "10px", border: "2px solid #1a2a4a", background: "#080f1e", color: "#fff", fontSize: "18px", fontWeight: 700, fontFamily: "monospace", textAlign: "center", outline: "none" }} />
-              </div>
-            </div>}
-
-            {/* Feedback */}
-            {calcFeedback && (
-              <div style={{ padding: "10px 14px", borderRadius: "8px", marginBottom: "12px", fontSize: "12px", fontWeight: 600, lineHeight: 1.4, position: "relative", background: calcFeedback.type === "success" ? "#4ade8015" : "#ef444415", border: `1px solid ${calcFeedback.type === "success" ? "#4ade8040" : "#ef444440"}`, color: calcFeedback.type === "success" ? "#4ade80" : "#fca5a5" }}>
-                {calcFeedback.msg}
-              </div>
-            )}
-
-            {calcAttempts > 0 && !calcPassed && (
-              <div style={{ fontSize: "10px", color: "#ef4444", textAlign: "center", marginBottom: "8px", position: "relative" }}>Attempts: {calcAttempts}</div>
-            )}
-
-            <div style={{ display: "flex", gap: "8px", position: "relative" }}>
-              <button onClick={checkCalcChallenge} disabled={calcPhase === 1 ? (!calcAnswerEnergy || !calcAnswerCost) : !calcAnswerKW} style={{ ...S.popupBtn, flex: 1, textAlign: "center", opacity: (calcPhase === 1 ? (calcAnswerEnergy && calcAnswerCost) : calcAnswerKW) ? 1 : 0.4, cursor: (calcPhase === 1 ? (calcAnswerEnergy && calcAnswerCost) : calcAnswerKW) ? "pointer" : "not-allowed" }}>
-                {calcPhase === 2 ? "✓ Submit kW Answer" : "✓ Submit Answer"}
-              </button>
-            </div>
-
-            {mathDifficulty === "medium" && calcPhase === 1 && <div style={{ textAlign: "center", marginTop: "8px", fontSize: "9px", color: "#f59e0b", position: "relative" }}>Step 1 of 2 — kW conversion follows</div>}
-            <div style={{ textAlign: "center", marginTop: "6px", fontSize: "9px", color: "#475569", position: "relative" }}>⚠ Each wrong answer costs 10% of your treasury</div>
-          </div>
-        </div>
+        <EnergyCalc
+          drag={dragCalc}
+          phase={calcPhase}
+          difficulty={mathDifficulty}
+          energyCount={energyCount}
+          generatorTotals={generatorTotals}
+          calcMode={calcMode}
+          toStdForm={toStdForm}
+          answerEnergy={calcAnswerEnergy}
+          setAnswerEnergy={setCalcAnswerEnergy}
+          answerCost={calcAnswerCost}
+          setAnswerCost={setCalcAnswerCost}
+          answerKW={calcAnswerKW}
+          setAnswerKW={setCalcAnswerKW}
+          feedback={calcFeedback}
+          attempts={calcAttempts}
+          passed={calcPassed}
+          onSubmit={checkCalcChallenge}
+        />
       )}
 
       {/* Task Popup */}
